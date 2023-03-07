@@ -1,7 +1,5 @@
 # EvoCoup
 
-![EvoCoup](images/evocoup4.jpeg)
-
 _(This project is a very early stage work-in-progress)_
 
 ### What is Coup?
@@ -26,4 +24,6 @@ Which works better, deep reinforcement learning, or evolutionary algorithms?
 * [ ] Integrate a neuro-evolution compatible framework, such as [EvoTorch](https://evotorch.ai/).
 * [ ] Integrate with OpenAI's [Gymnasium](https://github.com/Farama-Foundation/Gymnasium).
 * [ ] Develop a small web app to allow users to play against the AI.
+
+![EvoCoup](images/evocoup4.jpeg)
 

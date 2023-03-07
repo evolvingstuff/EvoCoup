@@ -385,24 +385,3 @@ def player_chooses_action(player: Player, players: List[Player]) -> (actions, Pl
 
 if __name__ == '__main__':
     main()
-
-
-'''
-Need to account for starting hand, but it is possible that the player may reveal a card to prove they had it, 
-do an exchange, and then use the new card to block a counteraction
-
-Choose randomly for now
-Notes
-    Cards are NOT returned back into the deck when influence is lost
-    Cards replaced and deck shuffled, however, when a player successfully answers a challenge
-    If 10 or more coins, must do a Coup
-    Any action or counteraction can be challenged by anyone
-Questions
-    If you lose an influence, does it go back in the deck?
-    In AI, if two players want to make challenges, which goes first? You never want to be the one to go first.
-        Could simulate a random time limit, and then specify their "bid" as to when they will do the challenge
-            This means there is a chance they won't challenge if time runs out
-Strategy
-    If I have a card that blocks an action, I know other people less likely to have card
-    therefore I can LIE and take the action that I know probably cannot be blocked
-'''

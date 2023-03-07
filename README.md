@@ -1,6 +1,6 @@
 # EvoCoup
 
-![EvoCoup](images/evocoup.jpeg)
+![EvoCoup](images/evocoup2.jpeg)
 
 _(This project is a very early stage work-in-progress)_
 

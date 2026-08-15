@@ -1,12 +1,12 @@
 # EvoCoup
 
-![EvoCoup — a Renaissance court of rivals](images/cover.png)
+![EvoCoup — a Renaissance court of rivals](images/group_picture.png)
 
 EvoCoup is a local web game and AI sandbox for playing faithful games of [Coup](https://www.ultraboardgames.com/coup/game-rules.php) against large language models—or watching a table of models play against one another.
 
 The project began as an experiment in evolving recurrent neural networks. Its new direction replaces that idea with LLM-controlled players, a rigorously tested rules engine, and an animated browser interface. The EvoCoup name is retained for now and may change later.
 
-> **Status:** the redevelopment is currently in the planning stage. The repository still contains the original random-play Python prototype; the new rules engine, OpenAI integration, and web application have not been implemented yet. See [PLAN.md](PLAN.md) for the implementation-ready specification.
+> **Status:** the standalone Python rules engine, in-memory FastAPI match runner, and OpenAI structured-decision adapter are implemented and tested. The React game interface is the next major milestone. See [PLAN.md](PLAN.md) for the full specification.
 
 ## The game
 
@@ -43,15 +43,40 @@ The model will never mutate game state directly. It chooses from options generat
 
 - [x] Audit the original simulator and define the new product direction.
 - [x] Specify the canonical rules, architecture, testing strategy, and v1 scope.
-- [ ] Preserve the original simulator under `legacy/` and scaffold the new projects.
-- [ ] Build the standalone rules engine with unit and property tests.
-- [ ] Stress-test thousands of complete headless games with test-only policies.
-- [ ] Build the in-memory FastAPI match runner and WebSocket API.
-- [ ] Add the OpenAI structured-decision adapter and diagnostics.
+- [x] Preserve the original simulator under `legacy/` and scaffold the Python project.
+- [x] Build the standalone rules engine with unit and property tests.
+- [x] Stress-test 10,000 complete headless games with test-only policies.
+- [x] Build the in-memory FastAPI match runner and WebSocket API.
+- [x] Add the OpenAI structured-decision adapter and diagnostics.
 - [ ] Build the functional React game table and human decision flows.
 - [ ] Add animations, spectator controls, the developer panel, and final polish.
 
 The detailed milestones, acceptance criteria, rule edge cases, and deferred features live in [PLAN.md](PLAN.md).
+
+## Development
+
+Install the Python environment and run the ordinary verification suite:
+
+```bash
+uv sync
+uv run pytest
+uv run ruff check src tests
+uv run mypy src tests
+```
+
+The ordinary suite includes unit tests, generated property tests, and hundreds of complete headless games. The separate 10,000-game stress target takes several minutes:
+
+```bash
+uv run pytest -m long
+```
+
+To run the local API, copy `.env.example` to `.env`, add an OpenAI API key, and start Uvicorn:
+
+```bash
+uv run uvicorn evocoup.api.app:app --reload
+```
+
+The API is available at `http://127.0.0.1:8000`; interactive endpoint documentation is available at `http://127.0.0.1:8000/docs`. Until the React frontend is implemented, the API and its generated documentation are the development interface.
 
 ## Visual direction
 
@@ -72,7 +97,7 @@ The interface is moving toward an original Renaissance woodcut and engraved-card
 
 ## Current prototype
 
-[`coup.py`](coup.py) is the original command-line simulator. It randomly chooses actions and responses to exercise an early implementation of the game loop. It does not contain an RNN, evolutionary training, LLM integration, or the new rules architecture, and it has known rule-resolution defects. It will be retained as historical context rather than extended into the new application.
+[`legacy/coup.py`](legacy/coup.py) is the original command-line simulator. It randomly chooses actions and responses to exercise an early implementation of the game loop. It does not contain an RNN, evolutionary training, LLM integration, or the new rules architecture, and it has known rule-resolution defects. It is retained as historical context rather than extended into the new application.
 
 ## Future directions
 

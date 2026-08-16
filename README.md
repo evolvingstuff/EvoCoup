@@ -1,6 +1,6 @@
 # EvoCoup
 
-![EvoCoup — a Renaissance court of rivals](images/group_picture.png)
+![EvoCoup — a Renaissance court of rivals](images/game_play.png)
 
 EvoCoup is a local web game and AI sandbox for playing faithful games of [Coup](https://www.ultraboardgames.com/coup/game-rules.php) against large language models—or watching a table of models play against one another.
 
@@ -123,6 +123,9 @@ The interface is moving toward an original Renaissance woodcut and engraved-card
     <td align="center"><img src="images/cards/card_back.png" alt="Card back" width="170"><br><strong>Card back</strong></td>
   </tr>
 </table>
+
+![EvoCoup — a Renaissance court of rivals](images/group_picture.png)
+
 
 ## Current prototype
 

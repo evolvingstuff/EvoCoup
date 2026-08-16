@@ -32,6 +32,7 @@ def test_two_player_published_variant_preserves_asymmetric_setup_knowledge() -> 
     assert len(first_request.options) == 5
     assert len(engine.seat_view(first_player_id).setup_choices) == 5
     assert len(engine.seat_view(second_player_id).setup_choices) == 5
+    assert all(player.is_alive for player in engine.public_view().players)
 
     chosen_role = first_request.options[0].data["role"]
     choose(engine, first_request.options[0].id)

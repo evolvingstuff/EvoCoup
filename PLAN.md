@@ -504,7 +504,7 @@ EvoCoup/
     ...legacy concept images...
 ```
 
-Keep engine tests alongside the Python project at the repository root. The frontend remains a conventional Vite application under `web/`.
+Keep engine tests alongside the Python project at the repository root. The frontend remains a conventional Vite application under `frontend/`.
 
 ## 11. Tooling and local development
 

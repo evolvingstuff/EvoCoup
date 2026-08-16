@@ -184,48 +184,23 @@ class GameEngine:
             return self._request(
                 player.id,
                 DecisionKind.ACTION,
-                f"Choose {player.name}'s action.",
+                "Choose your action."
+                if player.name == "You"
+                else f"Choose {player.name}'s action.",
                 tuple(self._action_options(player)),
             )
 
         if state.phase is GamePhase.ACTION_CHALLENGE:
             player_id = self._queue_head(state.response_queue, "action challenge")
-            action = self._require_action()
-            actor = state.player(action.actor_id)
-            challenge_options = (
-                LegalOption("action-challenge:pass", "Pass"),
-                LegalOption("action-challenge:challenge", f"Challenge {actor.name}"),
-            )
-            return self._request(
-                player_id,
-                DecisionKind.ACTION_CHALLENGE,
-                f"Challenge {actor.name}'s {self._require_action_role().value.title()} claim?",
-                challenge_options,
-            )
+            return self._action_challenge_request(player_id)
 
         if state.phase is GamePhase.BLOCK_WINDOW:
             player_id = self._queue_head(state.response_queue, "block")
-            return self._request(
-                player_id,
-                DecisionKind.BLOCK,
-                "Block the pending action?",
-                tuple(self._block_options()),
-            )
+            return self._block_request(player_id)
 
         if state.phase is GamePhase.BLOCK_CHALLENGE:
             player_id = self._queue_head(state.response_queue, "block challenge")
-            block = self._require_block()
-            blocker = state.player(block.blocker_id)
-            block_challenge_options = (
-                LegalOption("block-challenge:pass", "Pass"),
-                LegalOption("block-challenge:challenge", f"Challenge {blocker.name}"),
-            )
-            return self._request(
-                player_id,
-                DecisionKind.BLOCK_CHALLENGE,
-                f"Challenge {blocker.name}'s {block.claimed_role.value.title()} block?",
-                block_challenge_options,
-            )
+            return self._block_challenge_request(player_id)
 
         if state.phase is GamePhase.CLAIM_RESPONSE:
             challenge = self._require_challenge()
@@ -263,7 +238,7 @@ class GameEngine:
             return self._request(
                 player.id,
                 DecisionKind.LOSE_INFLUENCE,
-                f"Choose an influence to reveal: {pending_loss.reason}.",
+                f"{pending_loss.reason}. Choose an influence to reveal.",
                 influence_options,
             )
 
@@ -292,6 +267,26 @@ class GameEngine:
             )
 
         raise RuntimeError(f"unhandled game phase: {state.phase}")
+
+    def pending_response_decisions(self) -> tuple[DecisionRequest, ...]:
+        """Return the current response window as independent, read-only requests."""
+
+        if self.state.phase is GamePhase.ACTION_CHALLENGE:
+            factory = self._action_challenge_request
+        elif self.state.phase is GamePhase.BLOCK_WINDOW:
+            factory = self._block_request
+        elif self.state.phase is GamePhase.BLOCK_CHALLENGE:
+            factory = self._block_challenge_request
+        else:
+            return ()
+        return tuple(factory(player_id) for player_id in self.state.response_queue)
+
+    def decision_view(self, request: DecisionRequest) -> SeatGameView:
+        """Project one player's private view for an explicitly prepared request."""
+
+        from evocoup.domain.views import seat_view
+
+        return seat_view(self.state, request.player_id, request)
 
     def public_view(self) -> PublicGameView:
         """Return a projection containing only public game information."""
@@ -375,6 +370,46 @@ class GameEngine:
             kind=kind,
             prompt=prompt,
             options=options,
+        )
+
+    def _action_challenge_request(self, player_id: str) -> DecisionRequest:
+        action = self._require_action()
+        actor = self.state.player(action.actor_id)
+        return self._request(
+            player_id,
+            DecisionKind.ACTION_CHALLENGE,
+            f"Challenge the {self._require_action_role().value.title()} claim made by "
+            f"{actor.name}?",
+            (
+                LegalOption("action-challenge:pass", "Pass"),
+                LegalOption("action-challenge:challenge", f"Challenge {actor.name}"),
+            ),
+        )
+
+    def _block_request(self, player_id: str) -> DecisionRequest:
+        action = self._require_action()
+        actor = self.state.player(action.actor_id)
+        target = self.state.player(action.target_id) if action.target_id is not None else None
+        action_label = action.action.value.replace("_", " ").title()
+        target_clause = f" targeting {target.name}" if target is not None else ""
+        return self._request(
+            player_id,
+            DecisionKind.BLOCK,
+            f"{actor.name} declared {action_label}{target_clause}. Block it?",
+            tuple(self._block_options()),
+        )
+
+    def _block_challenge_request(self, player_id: str) -> DecisionRequest:
+        block = self._require_block()
+        blocker = self.state.player(block.blocker_id)
+        return self._request(
+            player_id,
+            DecisionKind.BLOCK_CHALLENGE,
+            f"Challenge the {block.claimed_role.value.title()} block made by {blocker.name}?",
+            (
+                LegalOption("block-challenge:pass", "Pass"),
+                LegalOption("block-challenge:challenge", f"Challenge {blocker.name}"),
+            ),
         )
 
     def _action_options(self, player: PlayerState) -> list[LegalOption]:
@@ -525,7 +560,7 @@ class GameEngine:
         self.state.phase = GamePhase.CLAIM_RESPONSE
         self._emit(
             EventType.CHALLENGE_DECLARED,
-            f"{challenger.name} challenged {actor.name}'s claim.",
+            f"{challenger.name} challenged the claim made by {actor.name}.",
             actor_id=challenger.id,
             target_id=actor.id,
             details={"claim_kind": ClaimKind.ACTION.value},
@@ -594,7 +629,7 @@ class GameEngine:
         self.state.phase = GamePhase.CLAIM_RESPONSE
         self._emit(
             EventType.CHALLENGE_DECLARED,
-            f"{challenger.name} challenged {blocker.name}'s block.",
+            f"{challenger.name} challenged the block made by {blocker.name}.",
             actor_id=challenger.id,
             target_id=blocker.id,
             details={"claim_kind": ClaimKind.BLOCK.value},
@@ -636,7 +671,7 @@ class GameEngine:
             self.state.pending_challenge = None
             self._request_influence_loss(
                 challenger.id,
-                f"lost a challenge against {claimant.name}",
+                f"You lost a challenge against {claimant.name}",
                 continuation,
             )
             return
@@ -656,7 +691,7 @@ class GameEngine:
         self.state.pending_challenge = None
         self._request_influence_loss(
             claimant.id,
-            f"lost a challenge to {challenger.name}",
+            f"You lost a challenge to {challenger.name}",
             continuation,
         )
 
@@ -697,9 +732,14 @@ class GameEngine:
             returned_coins = player.coins
             self.state.treasury += returned_coins
             player.coins = 0
+            eliminated_message = (
+                f"You were eliminated and returned {returned_coins} coins."
+                if player.name == "You"
+                else f"{player.name} was eliminated and returned {returned_coins} coins."
+            )
             self._emit(
                 EventType.PLAYER_ELIMINATED,
-                f"{player.name} was eliminated and returned {returned_coins} coins.",
+                eliminated_message,
                 actor_id=player.id,
                 details={"returned_coins": returned_coins},
             )
@@ -748,14 +788,14 @@ class GameEngine:
             label = "a Coup" if action.action is ActionType.COUP else "an Assassination"
             self._emit(
                 EventType.ACTION_RESOLVED,
-                f"{actor.name}'s {label} against {target.name} succeeded.",
+                f"The {label} by {actor.name} against {target.name} succeeded.",
                 actor_id=actor.id,
                 target_id=target.id,
                 details={"action": action.action.value},
             )
             self._request_influence_loss(
                 target.id,
-                f"targeted by {label}",
+                f"You were targeted by {label}",
                 Continuation.END_TURN,
             )
             return
@@ -811,7 +851,7 @@ class GameEngine:
         blocker = self.state.player(block.blocker_id)
         self._emit(
             EventType.BLOCK_SUCCEEDED,
-            f"{blocker.name}'s {block.claimed_role.value.title()} block succeeded.",
+            f"The {block.claimed_role.value.title()} block by {blocker.name} succeeded.",
             actor_id=blocker.id,
             target_id=action.actor_id,
             details={"role": block.claimed_role.value, "action": action.action.value},
@@ -827,7 +867,7 @@ class GameEngine:
         self.state.treasury -= action.paid_cost
         self._emit(
             EventType.COST_REFUNDED,
-            f"{actor.name}'s {action.paid_cost}-coin action cost was refunded.",
+            f"{actor.name} received a refund of {action.paid_cost} coins.",
             actor_id=actor.id,
             details={"coins": action.paid_cost},
         )
@@ -837,7 +877,10 @@ class GameEngine:
         action = self.state.pending_action
         actor_id = action.actor_id if action else self.state.active_player_id
         actor = self.state.player(actor_id)
-        self._emit(EventType.TURN_ENDED, f"{actor.name}'s turn ended.", actor_id=actor.id)
+        turn_ended_message = (
+            "Your turn ended." if actor.name == "You" else f"{actor.name}'s turn ended."
+        )
+        self._emit(EventType.TURN_ENDED, turn_ended_message, actor_id=actor.id)
         self.state.pending_action = None
         self.state.pending_block = None
         self.state.pending_challenge = None
@@ -893,7 +936,11 @@ class GameEngine:
         player = self.state.player(self.state.active_player_id)
         self._emit(
             EventType.TURN_STARTED,
-            f"Turn {self.state.turn}: {player.name} acts.",
+            (
+                f"Turn {self.state.turn}: it is your turn."
+                if player.name == "You"
+                else f"Turn {self.state.turn}: {player.name} acts."
+            ),
             actor_id=player.id,
         )
 

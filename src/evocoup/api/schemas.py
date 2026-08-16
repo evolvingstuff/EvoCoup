@@ -2,8 +2,9 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
+from evocoup.api.environment import OPENAI_KEY_VALUE
 from evocoup.application.match import MatchMode
 
 
@@ -22,3 +23,14 @@ class SubmitDecisionRequest(BaseModel):
 
 class ControlRequest(BaseModel):
     action: Literal["step", "play"]
+
+
+class ConfigureOpenAIRequest(BaseModel):
+    api_key: SecretStr = Field(min_length=20)
+
+    @field_validator("api_key", mode="before")
+    @classmethod
+    def validate_api_key(cls, value: object) -> object:
+        if not isinstance(value, str) or not OPENAI_KEY_VALUE.fullmatch(value):
+            raise ValueError("enter a valid OpenAI API key beginning with sk-")
+        return value

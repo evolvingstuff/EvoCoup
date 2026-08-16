@@ -4,7 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 from evocoup.domain.decisions import DecisionRequest
-from evocoup.domain.enums import ActionType, GamePhase, Role
+from evocoup.domain.enums import ActionType, ClaimKind, GamePhase, Role
 from evocoup.domain.events import GameEvent
 from evocoup.domain.models import GameState
 
@@ -41,6 +41,14 @@ class PendingBlockView:
 
 
 @dataclass(frozen=True, slots=True)
+class PendingChallengeView:
+    claimant_id: str
+    challenger_id: str
+    role: Role
+    claim_kind: ClaimKind
+
+
+@dataclass(frozen=True, slots=True)
 class PublicGameView:
     game_id: str
     version: int
@@ -53,6 +61,7 @@ class PublicGameView:
     treasury: int
     pending_action: PendingActionView | None
     pending_block: PendingBlockView | None
+    pending_challenge: PendingChallengeView | None
     winner_id: str | None
     history: tuple[GameEvent, ...]
 
@@ -89,6 +98,14 @@ def public_view(state: GameState) -> PublicGameView:
             blocker_id=state.pending_block.blocker_id,
             claimed_role=state.pending_block.claimed_role,
         )
+    pending_challenge = None
+    if state.pending_challenge is not None:
+        pending_challenge = PendingChallengeView(
+            claimant_id=state.pending_challenge.claimant_id,
+            challenger_id=state.pending_challenge.challenger_id,
+            role=state.pending_challenge.role,
+            claim_kind=state.pending_challenge.claim_kind,
+        )
     return PublicGameView(
         game_id=state.game_id,
         version=state.version,
@@ -106,7 +123,9 @@ def public_view(state: GameState) -> PublicGameView:
                 revealed_roles=tuple(
                     influence.card.role for influence in player.revealed_influences
                 ),
-                is_alive=player.is_alive,
+                # During the published two-player draft, players temporarily have no
+                # dealt influence yet. They are still participants, not eliminated.
+                is_alive=player.is_alive or state.phase is GamePhase.SETUP_SELECTION,
             )
             for player in state.players
         ),
@@ -114,6 +133,7 @@ def public_view(state: GameState) -> PublicGameView:
         treasury=state.treasury,
         pending_action=pending_action,
         pending_block=pending_block,
+        pending_challenge=pending_challenge,
         winner_id=state.winner_id,
         history=tuple(state.history),
     )

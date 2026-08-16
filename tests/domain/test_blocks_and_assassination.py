@@ -30,7 +30,14 @@ def test_caught_false_block_allows_foreign_aid_to_resolve() -> None:
     blocker = engine.state.player(require_request(engine).player_id)
     set_hidden_roles(engine, blocker.id, (Role.ASSASSIN, Role.CONTESSA))
     choose(engine, "block:duke")
+    challenger_id = require_request(engine).player_id
     choose(engine, "block-challenge:challenge")
+    public = engine.public_view()
+    assert public.pending_block is not None
+    assert public.pending_block.blocker_id == blocker.id
+    assert public.pending_challenge is not None
+    assert public.pending_challenge.claimant_id == blocker.id
+    assert public.pending_challenge.challenger_id == challenger_id
     choose(engine, "claim:concede")
     choose(engine, require_request(engine).options[0].id)
 
@@ -75,6 +82,9 @@ def test_only_target_can_block_assassination_or_steal() -> None:
         block_request = require_request(engine)
         assert block_request.kind is DecisionKind.BLOCK
         assert block_request.player_id == target.id
+        assert actor.name in block_request.prompt
+        assert target.name in block_request.prompt
+        assert action.title() in block_request.prompt
 
 
 def test_false_contessa_challenge_can_cost_target_two_influences() -> None:
@@ -92,6 +102,8 @@ def test_false_contessa_challenge_can_cost_target_two_influences() -> None:
     choose(engine, "claim:concede")
     first_loss = require_request(engine)
     assert first_loss.player_id == target.id
+    assert first_loss.prompt.startswith("You lost a challenge")
+    assert first_loss.prompt.endswith("Choose an influence to reveal.")
     choose(engine, first_loss.options[0].id)
     second_loss = require_request(engine)
     assert second_loss.kind is DecisionKind.LOSE_INFLUENCE

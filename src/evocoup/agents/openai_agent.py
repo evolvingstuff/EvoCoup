@@ -1,6 +1,7 @@
 """OpenAI Responses API implementation of the decision-provider boundary."""
 
 import json
+from copy import deepcopy
 from dataclasses import asdict
 from typing import Any, Literal, cast
 
@@ -34,14 +35,29 @@ class OpenAIDecisionProvider:
         self.reasoning_effort = reasoning_effort
         self.timeout_seconds = timeout_seconds
         self._client: Any = client or AsyncOpenAI(api_key=api_key, timeout=timeout_seconds)
+        self._session_memory: dict[str, list[dict[str, Any]]] = {}
+        self._player_names: dict[str, str] = {}
+
+    def set_session_memory(
+        self,
+        memories: dict[str, list[dict[str, Any]]],
+        player_names: dict[str, str],
+    ) -> None:
+        """Install server-session memories without sharing private data between agents."""
+
+        self._session_memory = deepcopy(memories)
+        self._player_names = dict(player_names)
 
     async def decide(
         self,
         request: DecisionRequest,
         view: SeatGameView,
     ) -> ProviderDecision:
+        agent_name = self._player_names.get(request.player_id)
         request_payload = {
             "prompt_version": PROMPT_VERSION,
+            "agent_identity": agent_name,
+            "prior_court_memory": deepcopy(self._session_memory.get(agent_name or "", [])),
             "seat_view": asdict(view),
             "decision": asdict(request),
         }

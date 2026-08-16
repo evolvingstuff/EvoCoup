@@ -6,7 +6,7 @@ EvoCoup is a local web game and AI sandbox for playing faithful games of [Coup](
 
 The project began as an experiment in evolving recurrent neural networks. Its new direction replaces that idea with LLM-controlled players, a rigorously tested rules engine, and an animated browser interface. The EvoCoup name is retained for now and may change later.
 
-> **Status:** the standalone Python rules engine, in-memory FastAPI match runner, and OpenAI structured-decision adapter are implemented and tested. The React game interface is the next major milestone. See [PLAN.md](PLAN.md) for the full specification.
+> **Status:** the standalone Python rules engine, in-memory FastAPI match runner, OpenAI structured-decision adapter, and playable React interface are implemented and tested. See [PLAN.md](PLAN.md) for the full specification.
 
 ## The game
 
@@ -48,20 +48,44 @@ The model will never mutate game state directly. It chooses from options generat
 - [x] Stress-test 10,000 complete headless games with test-only policies.
 - [x] Build the in-memory FastAPI match runner and WebSocket API.
 - [x] Add the OpenAI structured-decision adapter and diagnostics.
-- [ ] Build the functional React game table and human decision flows.
-- [ ] Add animations, spectator controls, the developer panel, and final polish.
+- [x] Build the functional React game table and human decision flows.
+- [x] Add spectator controls, API error recovery, and the optional developer panel.
+- [ ] Continue animation and visual polish after hands-on playtesting.
 
 The detailed milestones, acceptance criteria, rule edge cases, and deferred features live in [PLAN.md](PLAN.md).
 
 ## Development
 
-Install the Python environment and run the ordinary verification suite:
+Install the backend and frontend dependencies, then build the website:
 
 ```bash
 uv sync
+cd frontend
+npm install
+npm run build
+cd ..
+```
+
+Launch EvoCoup:
+
+```bash
+uv run uvicorn evocoup.api.app:app --reload
+```
+
+Open `http://127.0.0.1:8000` to play. If no key is configured, the site asks for one and the local server writes it to the git-ignored `.env` file with owner-only permissions. The provider is configured immediately without a restart. The key is never returned by the API or included in diagnostics.
+
+You can instead configure the environment before launching by copying `.env.example` to `.env` and setting `OPENAI_API_KEY` manually. The generated API documentation remains available at `http://127.0.0.1:8000/docs` for development.
+
+Run all ordinary verification checks with:
+
+```bash
 uv run pytest
 uv run ruff check src tests
 uv run mypy src tests
+cd frontend
+npm run build
+npm run lint
+npm test
 ```
 
 The ordinary suite includes unit tests, generated property tests, and hundreds of complete headless games. The separate 10,000-game stress target takes several minutes:
@@ -70,13 +94,18 @@ The ordinary suite includes unit tests, generated property tests, and hundreds o
 uv run pytest -m long
 ```
 
-To run the local API, copy `.env.example` to `.env`, add an OpenAI API key, and start Uvicorn:
+For frontend development with hot reload, run the backend and Vite in separate terminals:
 
 ```bash
+# Terminal 1, from the repository root
 uv run uvicorn evocoup.api.app:app --reload
+
+# Terminal 2
+cd frontend
+npm run dev
 ```
 
-The API is available at `http://127.0.0.1:8000`; interactive endpoint documentation is available at `http://127.0.0.1:8000/docs`. Until the React frontend is implemented, the API and its generated documentation are the development interface.
+The Vite development site is available at `http://127.0.0.1:5173` and proxies game requests to the backend.
 
 ## Visual direction
 

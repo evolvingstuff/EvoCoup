@@ -48,6 +48,24 @@ async def test_openai_provider_uses_structured_seat_safe_request() -> None:
         AgentDecisionOutput(choice_id=request.options[0].id, rationale="Safest move.")
     )
     provider = OpenAIDecisionProvider(api_key="test", client=client)
+    agent_name = engine.state.player(request.player_id).name
+    provider.set_session_memory(
+        {
+            agent_name: [
+                {
+                    "result": "lost",
+                    "my_private_decisions": [
+                        {
+                            "held_roles": ["captain"],
+                            "claimed_role": "duke",
+                            "knowingly_bluffed": True,
+                        }
+                    ],
+                }
+            ]
+        },
+        {request.player_id: agent_name},
+    )
 
     result = await provider.decide(request, engine.seat_view(request.player_id))
 
@@ -56,6 +74,11 @@ async def test_openai_provider_uses_structured_seat_safe_request() -> None:
     assert result.model == "gpt-test-snapshot"
     assert result.usage == {"input_tokens": 100, "output_tokens": 12, "total_tokens": 112}
     assert result.request_payload["prompt_version"] == PROMPT_VERSION
+    assert result.request_payload["agent_identity"] == agent_name
+    assert result.request_payload["prior_court_memory"][0]["result"] == "lost"
+    assert result.request_payload["prior_court_memory"][0]["my_private_decisions"][0][
+        "knowingly_bluffed"
+    ] is True
     assert client.responses.kwargs["instructions"] == SYSTEM_PROMPT
     assert client.responses.kwargs["text_format"] is AgentDecisionOutput
     assert client.responses.kwargs["store"] is False
@@ -76,3 +99,24 @@ async def test_openai_provider_rejects_missing_parsed_output() -> None:
 
     with pytest.raises(ValueError, match="parsed decision"):
         await provider.decide(request, engine.seat_view(request.player_id))
+
+
+def test_system_prompt_contains_the_action_and_challenge_reference() -> None:
+    assert PROMPT_VERSION == "coup-player-v3-session-memory"
+    for rule_term in (
+        "Income",
+        "Foreign Aid",
+        "Coup",
+        "Tax",
+        "Assassinate",
+        "Steal",
+        "Exchange",
+        "10 or more coins",
+        "challenge",
+        "block",
+        "refund",
+        "another to the assassination",
+        "Prior court memory",
+        "knew you were bluffing",
+    ):
+        assert rule_term in SYSTEM_PROMPT

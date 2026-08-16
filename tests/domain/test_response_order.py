@@ -35,3 +35,19 @@ def test_first_challenge_ends_the_response_window() -> None:
     assert claim_request.kind is DecisionKind.CLAIM_RESPONSE
     assert claim_request.player_id == actor.id
     assert first_challenger not in engine.state.response_queue
+
+
+def test_response_window_can_be_projected_for_every_player_without_mutation() -> None:
+    engine = GameEngine.new(["A", "B", "C", "D"], seed=32)
+    choose(engine, "action:tax")
+    queue_before = tuple(engine.state.response_queue)
+    version_before = engine.state.version
+
+    requests = engine.pending_response_decisions()
+
+    assert tuple(request.player_id for request in requests) == queue_before
+    assert all(request.kind is DecisionKind.ACTION_CHALLENGE for request in requests)
+    assert all(request.state_version == version_before for request in requests)
+    assert all(engine.decision_view(request).pending_decision == request for request in requests)
+    assert tuple(engine.state.response_queue) == queue_before
+    assert engine.state.version == version_before

@@ -15,7 +15,9 @@ import {
   type Role,
 } from "./types";
 
-type Playback = "paused" | "1x" | "2x" | "instant";
+const RESULT_DURATION_MS = 2100;
+const RESULT_ENTRY_DELAY_MS = 1400;
+const THREAD_DRAW_DURATION_MS = 1400;
 
 const ROLE_LABELS: Record<Role, string> = {
   duke: "Duke",
@@ -59,6 +61,18 @@ const ACTION_DESCRIPTIONS: Record<string, string> = {
   exchange: "Claim Ambassador, draw 2 Court cards, then return cards to restore your hand size. May be challenged.",
   steal: "Claim Captain and take up to 2 coins from the target. May be challenged or blocked with Captain or Ambassador.",
 };
+
+const ACTION_RESULT_LABELS: Record<string, string> = {
+  income: "Income collected",
+  foreign_aid: "Foreign Aid collected",
+  coup: "Coup succeeded",
+  tax: "Tax collected",
+  assassinate: "Assassination succeeded",
+  exchange: "Exchange complete",
+  steal: "Steal succeeded",
+};
+
+const CHALLENGEABLE_UNBLOCKABLE_ACTIONS = new Set(["tax", "exchange"]);
 
 type ActionProvenance = {
   kind: "basic" | "card" | "bluff";
@@ -178,151 +192,484 @@ function inwardOffset(x: number, y: number): { x: number; y: number } {
   return { x: unitX * distance, y: unitY * distance };
 }
 
-function recentAction(view: PublicGameView): PublicGameView["pending_action"] {
-  const latestSequence = view.history.at(-1)?.sequence ?? 0;
-  let event: GameEvent | null = null;
-  for (let index = view.history.length - 1; index >= 0; index -= 1) {
-    const candidate = view.history[index];
-    if (latestSequence - candidate.sequence > 4) break;
-    if (candidate.type === "action_declared") {
-      event = candidate;
-      break;
-    }
-  }
-  if (!event || !event.actor_id || typeof event.details.action !== "string") return null;
-  const claimedRole = event.details.claimed_role;
-  return {
-    actor_id: event.actor_id,
-    action: event.details.action,
-    target_id: event.target_id,
-    claimed_role:
-      typeof claimedRole === "string" && claimedRole in ROLE_LABELS
-        ? claimedRole as Role
-        : null,
-  };
-}
+type InteractionState = {
+  action: NonNullable<PublicGameView["pending_action"]> | null;
+  actionSequence: number;
+  status: "pending" | "succeeded" | "canceled" | "ended";
+  block: PublicGameView["pending_block"];
+  challenge: {
+    claimant_id: string;
+    challenger_id: string;
+    claim_kind: "action" | "block";
+  } | null;
+  actionProgressed: boolean;
+  blockProgressed: boolean;
+  concludingSequence: number | null;
+};
 
-function latestActionSequence(view: PublicGameView): number {
-  for (let index = view.history.length - 1; index >= 0; index -= 1) {
-    if (view.history[index].type === "action_declared") return view.history[index].sequence;
-  }
-  return 0;
-}
+const ACTION_PROGRESS_EVENTS = new Set([
+  "challenge_declared",
+  "block_declared",
+  "block_succeeded",
+  "claim_proven",
+  "claim_conceded",
+  "response_passed",
+]);
 
-function latestActionHadResponse(view: PublicGameView): boolean {
-  let declarationIndex = -1;
-  for (let index = view.history.length - 1; index >= 0; index -= 1) {
-    if (view.history[index].type === "action_declared") {
-      declarationIndex = index;
-      break;
-    }
-  }
-  if (declarationIndex < 0) return false;
-  return view.history.slice(declarationIndex + 1).some(
-    (event) =>
-      event.type === "challenge_declared"
-      || event.type === "block_declared"
-      || event.type === "block_succeeded",
-  );
-}
+const BLOCK_PROGRESS_EVENTS = new Set([
+  "challenge_declared",
+  "block_succeeded",
+  "claim_proven",
+  "claim_conceded",
+  "response_passed",
+]);
 
-function canceledAction(view: PublicGameView): PublicGameView["pending_action"] {
+function interactionState(view: PublicGameView, actionSequence?: number): InteractionState {
   let declaration: GameEvent | null = null;
   let declarationIndex = -1;
   for (let index = view.history.length - 1; index >= 0; index -= 1) {
-    if (view.history[index].type === "action_declared") {
+    if (
+      view.history[index].type === "action_declared"
+      && (actionSequence === undefined || view.history[index].sequence === actionSequence)
+    ) {
       declaration = view.history[index];
       declarationIndex = index;
       break;
     }
   }
-  if (!declaration || !declaration.actor_id || typeof declaration.details.action !== "string") {
-    return null;
+  let nextDeclarationIndex = view.history.length;
+  if (declarationIndex >= 0) {
+    for (let index = declarationIndex + 1; index < view.history.length; index += 1) {
+      if (view.history[index].type === "action_declared") {
+        nextDeclarationIndex = index;
+        break;
+      }
+    }
   }
-  const canceled = view.history.slice(declarationIndex + 1).some(
-    (event) =>
-      event.type === "block_succeeded"
+  let latestDeclarationIndex = -1;
+  for (let index = view.history.length - 1; index >= 0; index -= 1) {
+    if (view.history[index].type === "action_declared") {
+      latestDeclarationIndex = index;
+      break;
+    }
+  }
+  const isLatestAction = declarationIndex < 0 || declarationIndex === latestDeclarationIndex;
+  const action = declaration?.actor_id && typeof declaration.details.action === "string"
+    ? {
+        actor_id: declaration.actor_id,
+        action: declaration.details.action,
+        target_id: declaration.target_id,
+        claimed_role:
+          typeof declaration.details.claimed_role === "string"
+          && declaration.details.claimed_role in ROLE_LABELS
+            ? declaration.details.claimed_role as Role
+            : null,
+      }
+    : view.pending_action;
+  const actionEvents = declarationIndex >= 0
+    ? view.history.slice(declarationIndex + 1, nextDeclarationIndex)
+    : [];
+  const canceledEvent = actionEvents.find(
+    (event) => event.type === "block_succeeded"
       || (event.type === "claim_conceded" && event.details.claim_kind === "action"),
   );
-  if (!canceled) return null;
-  const claimedRole = declaration.details.claimed_role;
-  return {
-    actor_id: declaration.actor_id,
-    action: declaration.details.action,
-    target_id: declaration.target_id,
-    claimed_role:
-      typeof claimedRole === "string" && claimedRole in ROLE_LABELS
-        ? claimedRole as Role
-        : null,
-  };
-}
-
-function successfulAction(view: PublicGameView): PublicGameView["pending_action"] {
-  let declaration: GameEvent | null = null;
-  let declarationIndex = -1;
-  for (let index = view.history.length - 1; index >= 0; index -= 1) {
-    if (view.history[index].type === "action_declared") {
-      declaration = view.history[index];
-      declarationIndex = index;
+  const succeededEvent = actionEvents.find(
+    (event) => event.type === "action_resolved"
+      || (event.type === "exchange_completed" && event.actor_id === action?.actor_id),
+  );
+  const canceled = Boolean(canceledEvent);
+  const succeeded = Boolean(succeededEvent);
+  const ended = view.phase === "finished"
+    || view.winner_id !== null
+    || actionEvents.some((event) => event.type === "turn_ended");
+  let blockDeclarationIndex = -1;
+  let declaredBlock: PublicGameView["pending_block"] = null;
+  for (let index = actionEvents.length - 1; index >= 0; index -= 1) {
+    const blockEvent = actionEvents[index];
+    if (blockEvent.type === "block_declared") {
+      blockDeclarationIndex = index;
+      const role = blockEvent.details.role;
+      if (blockEvent.actor_id && typeof role === "string" && role in ROLE_LABELS) {
+        declaredBlock = {
+          blocker_id: blockEvent.actor_id,
+          claimed_role: role as Role,
+        };
+      }
       break;
     }
   }
-  if (!declaration || !declaration.actor_id || typeof declaration.details.action !== "string") {
-    return null;
-  }
-  const succeeded = view.history.slice(declarationIndex + 1).some(
-    (event) =>
-      event.type === "action_resolved"
-      || (event.type === "exchange_completed" && event.actor_id === declaration.actor_id),
+  const blockEvents = blockDeclarationIndex >= 0
+    ? actionEvents.slice(blockDeclarationIndex + 1)
+    : [];
+  const blockEnded = blockEvents.some(
+    (event) => event.type === "block_succeeded"
+      || (event.type === "claim_conceded" && event.details.claim_kind === "block"),
   );
-  if (!succeeded) return null;
-  const claimedRole = declaration.details.claimed_role;
   return {
-    actor_id: declaration.actor_id,
-    action: declaration.details.action,
-    target_id: declaration.target_id,
-    claimed_role:
-      typeof claimedRole === "string" && claimedRole in ROLE_LABELS
-        ? claimedRole as Role
-        : null,
+    action,
+    actionSequence: declaration?.sequence ?? 0,
+    status: canceled ? "canceled" : succeeded ? "succeeded" : ended ? "ended" : "pending",
+    block: !blockEnded && !canceled && !succeeded && !ended
+      ? (isLatestAction ? view.pending_block : null) ?? declaredBlock
+      : null,
+    challenge: !ended && isLatestAction && view.pending_challenge
+      ? {
+          claimant_id: view.pending_challenge.claimant_id,
+          challenger_id: view.pending_challenge.challenger_id,
+          claim_kind: view.pending_challenge.claim_kind,
+        }
+      : null,
+    actionProgressed: actionEvents.some((event) => ACTION_PROGRESS_EVENTS.has(event.type)),
+    blockProgressed: blockEvents.some((event) => BLOCK_PROGRESS_EVENTS.has(event.type)),
+    concludingSequence: canceledEvent?.sequence ?? succeededEvent?.sequence ?? null,
   };
 }
 
-function recentPlayerOutcomes(view: PublicGameView): Map<string, "positive" | "negative"> {
+function playerOutcomesForEvent(
+  view: PublicGameView,
+  sequence: number | null,
+): Map<string, "positive" | "negative"> {
   const outcomes = new Map<string, "positive" | "negative">();
-  const latestSequence = view.history.at(-1)?.sequence ?? 0;
-  for (const event of view.history) {
-    if (latestSequence - event.sequence > 8) continue;
-    if (event.type === "action_resolved") {
-      if (event.actor_id) outcomes.set(event.actor_id, "positive");
-      if (event.target_id) outcomes.set(event.target_id, "negative");
-    } else if (event.type === "claim_proven") {
-      if (event.target_id) outcomes.set(event.target_id, "negative");
-    } else if (event.type === "claim_conceded") {
-      if (event.actor_id) outcomes.set(event.actor_id, "negative");
-    } else if (event.type === "influence_lost" || event.type === "player_eliminated") {
-      if (event.actor_id) outcomes.set(event.actor_id, "negative");
-    }
+  if (sequence === null) return outcomes;
+  const event = view.history.find((candidate) => candidate.sequence === sequence);
+  if (!event) return outcomes;
+  if (event.type === "action_resolved") {
+    if (event.actor_id) outcomes.set(event.actor_id, "positive");
+    if (event.target_id) outcomes.set(event.target_id, "negative");
+  } else if (event.type === "influence_lost" || event.type === "player_eliminated") {
+    if (event.actor_id) outcomes.set(event.actor_id, "negative");
   }
   return outcomes;
 }
 
-function recentChallenge(
+function revealedRolesAtPresentation(
+  player: PlayerView,
   view: PublicGameView,
-): { claimant_id: string; challenger_id: string; claim_kind: "action" | "block" } | null {
+  sequence: number | null,
+): Role[] {
+  if (sequence === null) return player.revealed_roles;
+  const visible = [...player.revealed_roles];
+  for (const event of view.history) {
+    if (
+      event.sequence <= sequence
+      || event.type !== "influence_lost"
+      || event.actor_id !== player.id
+    ) continue;
+    const role = event.details.role;
+    if (typeof role !== "string" || !(role in ROLE_LABELS)) continue;
+    const index = visible.lastIndexOf(role as Role);
+    if (index >= 0) visible.splice(index, 1);
+  }
+  return visible;
+}
+
+type CourtResult = {
+  sequence: number;
+  actionSequence: number;
+  label: string;
+  kind: "action" | "block" | "challenge" | "replacement" | "reveal" | "loss" | "death" | "winner" | "neutral";
+  actorId: string | null;
+  action: NonNullable<PublicGameView["pending_action"]>;
+  block: PublicGameView["pending_block"];
+  blockConcluding: boolean;
+  challenge: {
+    claimant_id: string;
+    challenger_id: string;
+    claim_kind: "action" | "block";
+  } | null;
+  reveal: { playerId: string; role: Role } | null;
+  proofReturn: { playerId: string; role: Role; claimKind: "action" | "block" } | null;
+  replacement: { playerId: string } | null;
+  delayed?: boolean;
+};
+
+function courtResultsForLatestAction(view: PublicGameView): CourtResult[] {
+  let declarationIndex = -1;
+  for (let index = view.history.length - 1; index >= 0; index -= 1) {
+    if (view.history[index].type === "action_declared") {
+      declarationIndex = index;
+      break;
+    }
+  }
+  if (declarationIndex < 0) return [];
+  const declaration = view.history[declarationIndex];
+  const actionActorId = declaration.actor_id;
+  const actionName = declaration.details.action;
+  if (!actionActorId || typeof actionName !== "string") return [];
+  const claimedRole = declaration.details.claimed_role;
+  const resultAction: NonNullable<PublicGameView["pending_action"]> = {
+    actor_id: actionActorId,
+    action: actionName,
+    target_id: declaration.target_id,
+    claimed_role: typeof claimedRole === "string" && claimedRole in ROLE_LABELS
+      ? claimedRole as Role
+      : null,
+  };
+  const actionEvents = view.history.slice(declarationIndex + 1);
+  const actionChallengeDeclared = actionEvents.some((event) =>
+    event.type === "challenge_declared" && event.details.claim_kind === "action"
+  );
+  const blockChallengeDeclared = actionEvents.some((event) =>
+    event.type === "challenge_declared" && event.details.claim_kind === "block"
+  );
+  const blockDeclared = actionEvents.some((event) => event.type === "block_declared");
+  const lastChallengePass = [...actionEvents].reverse().find((event) =>
+    event.type === "response_passed" && event.details.window === "the action challenge"
+  );
+  const lastBlockPass = [...actionEvents].reverse().find((event) =>
+    event.type === "response_passed" && event.details.window === "the block opportunity"
+  );
+  const lastBlockChallengePass = [...actionEvents].reverse().find((event) =>
+    event.type === "response_passed" && event.details.window === "the block challenge"
+  );
+  const results: CourtResult[] = [];
+  let currentBlock: PublicGameView["pending_block"] = null;
+  const resultFrame = (
+    result: Omit<
+      CourtResult,
+      "actionSequence" | "actorId" | "action" | "block" | "blockConcluding" | "challenge" | "reveal" | "proofReturn" | "replacement"
+    >,
+    layers: {
+      block?: PublicGameView["pending_block"];
+      blockConcluding?: boolean;
+      challenge?: CourtResult["challenge"];
+      reveal?: CourtResult["reveal"];
+      proofReturn?: CourtResult["proofReturn"];
+      replacement?: CourtResult["replacement"];
+    } = {},
+  ): CourtResult => ({
+    ...result,
+    actionSequence: declaration.sequence,
+    actorId: actionActorId,
+    action: resultAction,
+    block: layers.block ?? null,
+    blockConcluding: layers.blockConcluding ?? false,
+    challenge: layers.challenge ?? null,
+    reveal: layers.reveal ?? null,
+    proofReturn: layers.proofReturn ?? null,
+    replacement: layers.replacement ?? null,
+  });
+  let currentChallenge: CourtResult["challenge"] = null;
+  for (let index = declarationIndex + 1; index < view.history.length; index += 1) {
+    const event = view.history[index];
+    if (event.type === "block_declared" && event.actor_id) {
+      const role = event.details.role;
+      if (typeof role === "string" && role in ROLE_LABELS) {
+        currentBlock = { blocker_id: event.actor_id, claimed_role: role as Role };
+      }
+    }
+    if (event.type === "block_succeeded" && !currentBlock && event.actor_id) {
+      const role = event.details.role;
+      if (typeof role === "string" && role in ROLE_LABELS) {
+        currentBlock = { blocker_id: event.actor_id, claimed_role: role as Role };
+      }
+    }
+    if (event.type === "challenge_declared" && event.actor_id && event.target_id) {
+      currentChallenge = {
+        challenger_id: event.actor_id,
+        claimant_id: event.target_id,
+        claim_kind: event.details.claim_kind === "block" ? "block" : "action",
+      };
+    }
+    if (
+      event.sequence === lastChallengePass?.sequence
+      && !actionChallengeDeclared
+      && view.phase !== "action_challenge"
+    ) {
+      results.push(resultFrame({ sequence: event.sequence, label: "No challenges", kind: "neutral" }));
+    }
+    if (
+      event.sequence === lastBlockPass?.sequence
+      && !blockDeclared
+      && view.phase !== "block_window"
+    ) {
+      results.push(resultFrame({ sequence: event.sequence, label: "No blocks", kind: "neutral" }));
+    }
+    if (
+      event.sequence === lastBlockChallengePass?.sequence
+      && !blockChallengeDeclared
+      && view.phase !== "block_challenge"
+    ) {
+      results.push(resultFrame(
+        { sequence: event.sequence, label: "No challenges", kind: "neutral" },
+        { block: currentBlock },
+      ));
+    }
+    if (event.type === "block_succeeded") {
+      results.push(resultFrame(
+        { sequence: event.sequence, label: "Block succeeded", kind: "block" },
+        { block: currentBlock, blockConcluding: true },
+      ));
+    }
+    if (event.type === "claim_conceded") {
+      results.push(resultFrame({
+        sequence: event.sequence,
+        label: event.details.claim_kind === "block"
+          ? "Block challenge succeeded"
+          : "Action challenge succeeded",
+        kind: "challenge",
+      }, {
+        block: event.details.claim_kind === "block" ? currentBlock : null,
+        blockConcluding: event.details.claim_kind === "block",
+        challenge: currentChallenge,
+      }));
+    }
+    if (event.type === "claim_proven") {
+      let challengedBlock = false;
+      for (let challengeIndex = index - 1; challengeIndex > declarationIndex; challengeIndex -= 1) {
+        const candidate = view.history[challengeIndex];
+        if (candidate.type !== "challenge_declared") continue;
+        challengedBlock = candidate.details.claim_kind === "block";
+        break;
+      }
+      const provenRole = event.details.role;
+      results.push(resultFrame({
+        sequence: event.sequence,
+        label: challengedBlock ? "Block challenge failed" : "Action challenge failed",
+        kind: "challenge",
+      }, {
+        block: challengedBlock ? currentBlock : null,
+        challenge: currentChallenge,
+        proofReturn: event.actor_id
+          && typeof provenRole === "string"
+          && provenRole in ROLE_LABELS
+          ? {
+              playerId: event.actor_id,
+              role: provenRole as Role,
+              claimKind: challengedBlock ? "block" : "action",
+            }
+          : null,
+      }));
+    }
+    if (event.type === "card_replaced" && event.actor_id) {
+      const player = view.players.find((candidate) => candidate.id === event.actor_id);
+      if (player) {
+        results.push(resultFrame({
+          sequence: event.sequence,
+          label: `${playerLabel(player)} drew a replacement`,
+          kind: "replacement",
+        }, {
+          block: currentBlock,
+          challenge: null,
+          replacement: { playerId: event.actor_id },
+        }));
+      }
+    }
+    if (
+      CHALLENGEABLE_UNBLOCKABLE_ACTIONS.has(actionName)
+      && (event.type === "action_resolved" || event.type === "exchange_completed")
+    ) {
+      results.push(resultFrame({
+        sequence: event.sequence - 0.01,
+        label: "Cannot be blocked",
+        kind: "neutral",
+      }));
+    }
+    if (event.type === "exchange_completed") {
+      results.push(resultFrame({ sequence: event.sequence, label: "Exchange complete", kind: "action" }));
+    }
+    if (event.type === "action_resolved" && typeof event.details.action === "string") {
+      results.push(resultFrame({
+        sequence: event.sequence,
+        label: ACTION_RESULT_LABELS[event.details.action]
+          ?? `${titleCase(event.details.action)} succeeded`,
+        kind: "action",
+      }));
+    }
+    if (event.type === "influence_lost" && event.actor_id) {
+      const revealedRole = event.details.role;
+      const revealedPlayer = view.players.find((candidate) => candidate.id === event.actor_id);
+      if (
+        revealedPlayer
+        && typeof revealedRole === "string"
+        && revealedRole in ROLE_LABELS
+      ) {
+        results.push(resultFrame({
+          sequence: event.sequence - 0.01,
+          label: `${playerLabel(revealedPlayer)} revealed ${ROLE_LABELS[revealedRole as Role]}`,
+          kind: "reveal",
+        }, {
+          block: currentBlock,
+          challenge: null,
+          reveal: { playerId: event.actor_id, role: revealedRole as Role },
+        }));
+      }
+      const eliminated = actionEvents.some(
+        (candidate) => candidate.type === "player_eliminated"
+          && candidate.actor_id === event.actor_id
+          && candidate.sequence > event.sequence,
+      );
+      const player = view.players.find((candidate) => candidate.id === event.actor_id);
+      if (!eliminated && player) {
+        results.push(resultFrame({
+          sequence: event.sequence,
+          label: player.name === "You"
+            ? "You lost an influence"
+            : `${playerLabel(player)} lost an influence`,
+          kind: "loss",
+        }));
+      }
+    }
+    if (event.type === "player_eliminated" && event.actor_id) {
+      const player = view.players.find((candidate) => candidate.id === event.actor_id);
+      if (player) {
+        results.push(resultFrame({
+          sequence: event.sequence,
+          label: player.name === "You" ? "You have died" : `${playerLabel(player)} has died`,
+          kind: "death",
+        }, { block: currentBlock, challenge: null }));
+      }
+    }
+    if (event.type === "game_finished" && event.actor_id) {
+      const player = view.players.find((candidate) => candidate.id === event.actor_id);
+      if (player) {
+        results.push(resultFrame({
+          sequence: event.sequence,
+          label: `${playerLabel(player)} wins`,
+          kind: "winner",
+        }));
+      }
+    }
+  }
+  return results;
+}
+
+function courtResultsForHistory(view: PublicGameView): CourtResult[] {
+  const declarationIndices = view.history.flatMap((event, index) =>
+    event.type === "action_declared" ? [index] : []
+  );
+  return declarationIndices.flatMap((declarationIndex, index) => {
+    const nextDeclarationIndex = declarationIndices[index + 1] ?? view.history.length;
+    return courtResultsForLatestAction({
+      ...view,
+      history: view.history.slice(0, nextDeclarationIndex),
+      phase: index === declarationIndices.length - 1 ? view.phase : "turn_start",
+    });
+  });
+}
+
+function recentCardReplacement(
+  view: PublicGameView,
+  playerId: string | null,
+): { sequence: number; returnedRole: Role | null } | null {
+  if (!playerId) return null;
   const latestSequence = view.history.at(-1)?.sequence ?? 0;
   for (let index = view.history.length - 1; index >= 0; index -= 1) {
     const event = view.history[index];
-    if (latestSequence - event.sequence > 3) break;
-    if (event.type === "claim_proven" || event.type === "claim_conceded") return null;
-    if (event.type === "challenge_declared" && event.actor_id && event.target_id) {
-      const claimKind = event.details.claim_kind === "block" ? "block" : "action";
-      return {
-        challenger_id: event.actor_id,
-        claimant_id: event.target_id,
-        claim_kind: claimKind,
-      };
+    if (latestSequence - event.sequence > 6) break;
+    if (event.type !== "card_replaced" || event.actor_id !== playerId) continue;
+    let role: unknown = null;
+    for (let proofIndex = index - 1; proofIndex >= Math.max(0, index - 3); proofIndex -= 1) {
+      const candidate = view.history[proofIndex];
+      if (candidate.type === "claim_proven" && candidate.actor_id === playerId) {
+        role = candidate.details.role;
+        break;
+      }
     }
+    return {
+      sequence: event.sequence,
+      returnedRole: typeof role === "string" && role in ROLE_LABELS ? role as Role : null,
+    };
   }
   return null;
 }
@@ -330,39 +677,54 @@ function recentChallenge(
 function TravelingThreadGraphics({
   sourceAnchorId,
   targetAnchorId,
+  labelElementId,
   stopAtTargetEdge,
   bend,
   kind,
   pulseTarget = true,
-  duration = 1400,
+  animate = true,
+  paused = false,
+  duration = THREAD_DRAW_DURATION_MS,
 }: {
   sourceAnchorId: string;
   targetAnchorId?: string;
+  labelElementId?: string;
   stopAtTargetEdge?: boolean;
   bend: number;
   kind: "action" | "response";
   pulseTarget?: boolean;
+  animate?: boolean;
+  paused?: boolean;
   duration?: number;
 }) {
   const shadowRef = useRef<SVGPathElement>(null);
   const lineRef = useRef<SVGPathElement>(null);
   const arrowRef = useRef<SVGGElement>(null);
   const targetRef = useRef<SVGCircleElement>(null);
+  const elapsedRef = useRef(0);
+  const animationIdentityRef = useRef("");
 
   useLayoutEffect(() => {
     const line = lineRef.current;
     const shadow = shadowRef.current;
     const arrow = arrowRef.current;
     const target = targetRef.current;
+    const label = labelElementId ? document.getElementById(labelElementId) : null;
     const sourceAnchor = document.getElementById(sourceAnchorId);
     const targetAnchor = targetAnchorId ? document.getElementById(targetAnchorId) : null;
     const svg = line?.ownerSVGElement;
     if (!line || !shadow || !arrow || !target || !sourceAnchor || !svg) return;
+    const animationIdentity = `${sourceAnchorId}:${targetAnchorId ?? "center"}:${labelElementId ?? ""}`;
+    if (animationIdentityRef.current !== animationIdentity) {
+      animationIdentityRef.current = animationIdentity;
+      elapsedRef.current = 0;
+    }
     const svgBounds = svg.getBoundingClientRect();
     if (!svgBounds.width || !svgBounds.height) {
       line.style.opacity = "1";
       shadow.style.opacity = "1";
       arrow.style.opacity = "1";
+      if (label) label.style.opacity = "1";
       return;
     }
     const toPoint = (bounds: DOMRect) => ({
@@ -426,24 +788,49 @@ function TravelingThreadGraphics({
         (point.x - firstControl.x) * xScale,
       ) * 180 / Math.PI;
       arrow.setAttribute("transform", `translate(${point.x} ${point.y}) rotate(${angle})`);
+      if (label) {
+        const labelProgress = 0.52;
+        const inverse = 1 - labelProgress;
+        const labelPoint = {
+          x: inverse ** 2 * source.x
+            + 2 * inverse * labelProgress * firstControl.x
+            + labelProgress ** 2 * point.x,
+          y: inverse ** 2 * source.y
+            + 2 * inverse * labelProgress * firstControl.y
+            + labelProgress ** 2 * point.y,
+        };
+        label.style.left = `${labelPoint.x}%`;
+        label.style.top = `${labelPoint.y}%`;
+        label.style.opacity = progress > 0.16 ? "1" : "0";
+      }
     };
-    drawTo(0);
+    if (!animate) {
+      elapsedRef.current = 1;
+      drawTo(1);
+      target.classList.add("thread-target--arrived");
+      return;
+    }
+
+    drawTo(1 - (1 - elapsedRef.current) ** 3);
+    if (paused) return;
 
     let frame = 0;
     const startedAt = performance.now();
-    const animate = (now: number) => {
-      const elapsed = Math.min(1, (now - startedAt) / duration);
+    const startingElapsed = elapsedRef.current;
+    const animateFrame = (now: number) => {
+      const elapsed = Math.min(1, startingElapsed + (now - startedAt) / duration);
+      elapsedRef.current = elapsed;
       const progress = 1 - (1 - elapsed) ** 3;
       drawTo(progress);
       if (elapsed < 1) {
-        frame = window.requestAnimationFrame(animate);
+        frame = window.requestAnimationFrame(animateFrame);
       } else {
         target.classList.add("thread-target--arrived");
       }
     };
-    frame = window.requestAnimationFrame(animate);
+    frame = window.requestAnimationFrame(animateFrame);
     return () => window.cancelAnimationFrame(frame);
-  }, [bend, duration, sourceAnchorId, stopAtTargetEdge, targetAnchorId]);
+  }, [animate, bend, duration, labelElementId, paused, sourceAnchorId, stopAtTargetEdge, targetAnchorId]);
 
   return (
     <>
@@ -539,7 +926,7 @@ function decisionOptionDescription(
   return null;
 }
 
-function statusCopy(match: MatchPayload): string {
+function statusCopy(match: MatchPayload, spectatorPaused = false): string {
   const view = gameView(match);
   if (match.status === "finished") {
     const winner = view.players.find((player) => player.id === view.winner_id);
@@ -547,6 +934,8 @@ function statusCopy(match: MatchPayload): string {
   }
   if (match.status === "agent_error") return "The court has fallen silent";
   if (match.status === "waiting_for_human") return "Your counsel is required";
+  if (match.mode === "ai_only" && spectatorPaused) return "The court is paused";
+  if (match.mode === "ai_only" && match.status === "paused") return "The court deliberates";
   if (match.status === "paused") return "The court is paused";
   return "The court deliberates";
 }
@@ -694,22 +1083,69 @@ function Landing({
   );
 }
 
-function InfluenceStack({ player }: { player: PlayerView }) {
+function InfluenceStack({ player, revealedRoles }: { player: PlayerView; revealedRoles: Role[] }) {
   return (
-    <div className="influence-stack" aria-label={`${player.hidden_influence_count} hidden influence`}>
-      {Array.from({ length: player.hidden_influence_count }, (_, index) => (
-        <img key={`hidden-${index}`} src="/images/cards/card_back.png" alt="Hidden influence" />
-      ))}
-      {player.revealed_roles.map((role, index) => (
+    <div
+      className="influence-stack"
+      aria-label={`${player.hidden_influence_count} hidden influence`}
+    >
+      <div id={`influence-stack-${player.id}`} className="influence-stack__hidden">
+        {Array.from({ length: player.hidden_influence_count }, (_, index) => (
+          <img key={`hidden-${index}`} src="/images/cards/card_back.png" alt="Hidden influence" />
+        ))}
+      </div>
+      {revealedRoles.length > 0 && (
         <div
-          className="revealed-card"
-          key={`${role}-${index}`}
-          title={`${ROLE_LABELS[role]} — ${ROLE_RULES[role]}`}
+          className="revealed-influence-row"
+          aria-label={`${revealedRoles.length} revealed influence`}
         >
-          <img src={roleImage(role)} alt={`Revealed ${ROLE_LABELS[role]}`} />
-          <span>×</span>
+          {revealedRoles.map((role, index) => (
+            <div
+              className="revealed-card"
+              key={`${role}-${index}`}
+              title={`${ROLE_LABELS[role]} — ${ROLE_RULES[role]}`}
+              tabIndex={0}
+            >
+              <img src={roleImage(role)} alt={`Revealed ${ROLE_LABELS[role]}`} />
+              <span>×</span>
+            </div>
+          ))}
         </div>
-      ))}
+      )}
+    </div>
+  );
+}
+
+function ThinkingIndicator({
+  label,
+  player,
+  afterFailedChallenge,
+}: {
+  label: string | null;
+  player: PlayerView;
+  afterFailedChallenge: boolean;
+}) {
+  const [renderedLabel, setRenderedLabel] = useState(label);
+  useEffect(() => {
+    const timeout = window.setTimeout(
+      () => setRenderedLabel(label),
+      label ? 0 : 220,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [label]);
+  if (!player.is_alive) return null;
+  return (
+    <div
+      className={`thinking-indicator${
+        afterFailedChallenge && renderedLabel === "choosing a card to reveal…"
+          ? " thinking-indicator--after-failed-challenge"
+          : ""
+      }${label ? " thinking-indicator--visible" : ""}`}
+      aria-label={label ? `${playerLabel(player)}: ${renderedLabel}` : undefined}
+      aria-hidden={!label}
+    >
+      <span /><span /><span />
+      <small>{renderedLabel ?? ""}</small>
     </div>
   );
 }
@@ -719,27 +1155,43 @@ function PlayerSeat({
   count,
   active,
   human,
+  revealedRoles,
+  winning,
   thinkingLabel,
   pendingAction,
   actionTarget,
-  actionTransient,
-  responseKind,
-  responseRole,
-  responseTransient,
+  actionEntering,
+  actionSubdued,
+  actionConcluding,
+  actionConcludingDelayed,
+  blockingRole,
+  blockEntering,
+  blockSubdued,
+  blockConcluding,
+  challenging,
   outcome,
+  outcomeDelayed,
 }: {
   player: PlayerView;
   count: number;
   active: boolean;
   human: boolean;
+  revealedRoles: Role[];
+  winning: boolean;
   thinkingLabel: string | null;
   pendingAction: PublicGameView["pending_action"];
   actionTarget: PlayerView | null;
-  actionTransient: boolean;
-  responseKind: "blocking" | "challenging" | null;
-  responseRole: Role | null;
-  responseTransient: boolean;
+  actionEntering: boolean;
+  actionSubdued: boolean;
+  actionConcluding: boolean;
+  actionConcludingDelayed: boolean;
+  blockingRole: Role | null;
+  blockEntering: boolean;
+  blockSubdued: boolean;
+  blockConcluding: boolean;
+  challenging: boolean;
   outcome: "positive" | "negative" | null;
+  outcomeDelayed: boolean;
 }) {
   const { x, y } = seatPosition(player, count);
   const inward = inwardOffset(x, y);
@@ -754,7 +1206,10 @@ function PlayerSeat({
       id={`seat-anchor-${player.id}`}
       className={`player-seat${active ? " player-seat--active" : ""}${
         player.is_alive ? "" : " player-seat--fallen"
-      }${human ? " player-seat--human" : ""}`}
+      }${human ? " player-seat--human" : ""}${
+        challenging ? " player-seat--challenging" : ""
+      }${winning ? " player-seat--winner" : ""
+      }`}
       style={style}
       aria-label={`${human ? "You" : player.name}: ${player.coins} coins, ${player.hidden_influence_count} hidden influence`}
     >
@@ -767,24 +1222,22 @@ function PlayerSeat({
           <b>{player.coins}</b>
           <span className="resource-label">coin{player.coins === 1 ? "" : "s"}</span>
         </div>
-        <InfluenceStack player={player} />
+        <InfluenceStack player={player} revealedRoles={revealedRoles} />
       </div>
-      {thinkingLabel && player.is_alive && (
-        <div
-          className={`thinking-indicator${
-            outcome === "negative" && thinkingLabel === "choosing a card to reveal…"
-              ? " thinking-indicator--after-failed-challenge"
-              : ""
-          }`}
-          aria-label={`${playerLabel(player)}: ${thinkingLabel}`}
-        >
-          <span /><span /><span />
-          <small>{thinkingLabel}</small>
-        </div>
-      )}
+      <ThinkingIndicator
+        label={thinkingLabel}
+        player={player}
+        afterFailedChallenge={outcome === "negative"}
+      />
       {pendingAction && (
         <div
-          className={`seat-action-claim${actionTransient ? " seat-action-claim--transient" : ""}`}
+          className={`seat-action-claim${
+            actionEntering ? " seat-action-claim--entering" : ""
+          }${
+            actionSubdued ? " seat-action-claim--subdued" : ""
+          }${actionConcluding ? " seat-action-claim--concluding" : ""}${
+            actionConcludingDelayed ? " action-concluding--delayed" : ""
+          }`}
           aria-label={`${playerLabel(player)} claims ${pendingAction.claimed_role ? ROLE_LABELS[pendingAction.claimed_role] : titleCase(pendingAction.action)} for ${titleCase(pendingAction.action)}${actionTarget ? ` against ${playerLabel(actionTarget)}` : ""}`}
           title={`${titleCase(pendingAction.action)}${actionTarget ? ` against ${playerLabel(actionTarget)}` : ""}. ${pendingAction.claimed_role ? `Claimed ${ROLE_LABELS[pendingAction.claimed_role]}; this may be a bluff.` : ACTION_DESCRIPTIONS[pendingAction.action] ?? ""}`}
           tabIndex={0}
@@ -800,7 +1253,6 @@ function PlayerSeat({
               {ACTION_MARKS[pendingAction.action] ?? "◇"}
             </b>
           )}
-          <span>{titleCase(pendingAction.action)}</span>
           {pendingAction.claimed_role && <small>claim</small>}
           {pendingAction.claimed_role && (
             <div className="board-role-tooltip" role="tooltip">
@@ -811,34 +1263,33 @@ function PlayerSeat({
           )}
         </div>
       )}
-      {responseKind && (
+      {blockingRole && (
         <div
-          className={`seat-response-indicator seat-response-indicator--${responseKind}${responseTransient ? " seat-response-indicator--transient" : ""}`}
-          aria-label={`${playerLabel(player)} ${human ? "are" : "is"} ${responseKind}${responseRole ? ` as ${ROLE_LABELS[responseRole]}` : ""}`}
+          className={`seat-response-indicator seat-response-indicator--blocking${
+            blockEntering ? " seat-response-indicator--entering" : ""
+          }${blockSubdued ? " seat-response-indicator--subdued" : ""}${
+            blockConcluding ? " seat-response-indicator--concluding" : ""
+          }`}
+          aria-label={`${playerLabel(player)} is blocking as ${ROLE_LABELS[blockingRole]}`}
           tabIndex={0}
         >
-          {responseRole ? (
-            <img
-              id={`block-card-anchor-${player.id}`}
-              src={roleImage(responseRole)}
-              alt=""
-            />
-          ) : (
-            <b id={`challenge-x-anchor-${player.id}`} aria-hidden="true">⚔</b>
-          )}
-          <span>{responseKind}</span>
-          {responseRole && (
-            <div className="board-role-tooltip board-role-tooltip--response" role="tooltip">
-              <strong>{ROLE_LABELS[responseRole]} · Claimed block</strong>
-              <span>{ROLE_RULES[responseRole]}</span>
-              <em>This card represents a claim and may be a bluff.</em>
-            </div>
-          )}
+          <img
+            id={`block-card-anchor-${player.id}`}
+            src={roleImage(blockingRole)}
+            alt=""
+          />
+          <div className="board-role-tooltip board-role-tooltip--response" role="tooltip">
+            <strong>{ROLE_LABELS[blockingRole]} · Claimed block</strong>
+            <span>{ROLE_RULES[blockingRole]}</span>
+            <em>This card represents a claim and may be a bluff.</em>
+          </div>
         </div>
       )}
       {outcome && (
         <div
-          className={`player-outcome-stamp player-outcome-stamp--${outcome}`}
+          className={`player-outcome-stamp player-outcome-stamp--${outcome}${
+            outcomeDelayed ? " player-outcome-stamp--delayed" : ""
+          }`}
           aria-label={`${outcome === "positive" ? "Positive" : "Negative"} action outcome for ${playerLabel(player)}`}
         >
           {outcome === "positive" ? "✓" : "×"}
@@ -852,17 +1303,25 @@ function PlayerSeat({
 function ActionThread({
   action,
   view,
-  transient,
   canceled,
   succeeded,
   pulseTarget,
+  animate,
+  subdued = false,
+  concluding = false,
+  concludingDelayed = false,
+  paused = false,
 }: {
   action: NonNullable<PublicGameView["pending_action"]>;
   view: PublicGameView;
-  transient: boolean;
   canceled: boolean;
   succeeded: boolean;
   pulseTarget: boolean;
+  animate: boolean;
+  subdued?: boolean;
+  concluding?: boolean;
+  concludingDelayed?: boolean;
+  paused?: boolean;
 }) {
   const actor = view.players.find((player) => player.id === action.actor_id);
   const target = action.target_id
@@ -870,23 +1329,46 @@ function ActionThread({
     : null;
   if (!actor) return null;
   const destinationLabel = target ? playerLabel(target) : "the center of the table";
+  const lineLabelId = `action-line-label-${actor.id}`;
   return (
-    <svg
-      className={`action-thread${transient ? " action-thread--transient" : ""}`}
-      viewBox="0 0 100 100"
-      preserveAspectRatio="none"
-      role="img"
-      aria-label={`${titleCase(action.action)} from ${playerLabel(actor)} to ${destinationLabel}${canceled ? ", canceled" : succeeded ? ", succeeded" : ""}`}
-    >
-      <TravelingThreadGraphics
-        sourceAnchorId={`action-card-anchor-${actor.id}`}
-        targetAnchorId={target ? `seat-anchor-${target.id}` : undefined}
-        stopAtTargetEdge={Boolean(target)}
-        bend={-7}
-        kind="action"
-        pulseTarget={pulseTarget}
-      />
-    </svg>
+    <>
+      <svg
+        className={`action-thread${
+          animate ? "" : " action-thread--resumed"
+        }${subdued ? " action-thread--subdued" : ""}${
+          concluding ? " action-thread--concluding" : ""
+        }${concludingDelayed ? " action-concluding--delayed" : ""}`}
+        viewBox="0 0 100 100"
+        preserveAspectRatio="none"
+        role="img"
+        aria-label={`${titleCase(action.action)} from ${playerLabel(actor)} to ${destinationLabel}${canceled ? ", canceled" : succeeded ? ", succeeded" : ""}`}
+      >
+        <TravelingThreadGraphics
+          sourceAnchorId={action.claimed_role
+            ? `action-card-anchor-${actor.id}`
+            : `seat-anchor-${actor.id}`}
+          targetAnchorId={target ? `seat-anchor-${target.id}` : undefined}
+          labelElementId={lineLabelId}
+          stopAtTargetEdge={Boolean(target)}
+          bend={-7}
+          kind="action"
+          pulseTarget={pulseTarget}
+          animate={animate}
+          paused={paused}
+        />
+      </svg>
+      <span
+        id={lineLabelId}
+        className={`action-thread__label${
+          subdued ? " action-thread__label--subdued" : ""
+        }${concluding ? " action-thread__label--concluding" : ""}${
+          concludingDelayed ? " action-concluding--delayed" : ""
+        }`}
+        aria-hidden="true"
+      >
+        {titleCase(action.action)}
+      </span>
+    </>
   );
 }
 
@@ -896,37 +1378,64 @@ function ResponseThread({
   view,
   kind,
   targetKind,
-  transient = false,
   pulseTarget = true,
+  animate = true,
+  subdued = false,
+  concluding = false,
+  paused = false,
 }: {
   from: string;
   to: string;
   view: PublicGameView;
   kind: "block" | "challenge";
   targetKind: "action" | "block";
-  transient?: boolean;
   pulseTarget?: boolean;
+  animate?: boolean;
+  subdued?: boolean;
+  concluding?: boolean;
+  paused?: boolean;
 }) {
   const sourcePlayer = view.players.find((player) => player.id === from);
   const targetPlayer = view.players.find((player) => player.id === to);
   if (!sourcePlayer || !targetPlayer) return null;
+  const lineLabel = kind === "block" ? "Blocking" : "Challenge";
+  const lineLabelId = `response-line-label-${kind}-${from}`;
   return (
-    <svg
-      className={`response-thread response-thread--${kind}${transient ? " response-thread--transient" : ""}`}
-      viewBox="0 0 100 100"
-      preserveAspectRatio="none"
-      role="img"
-      aria-label={`${kind === "block" ? "Block" : "Challenge"} from ${playerLabel(sourcePlayer)} to ${playerLabel(targetPlayer)}`}
-    >
-      <TravelingThreadGraphics
-        sourceAnchorId={`${kind === "block" ? "block-card" : "challenge-x"}-anchor-${from}`}
-        targetAnchorId={`${targetKind}-card-anchor-${to}`}
-        stopAtTargetEdge
-        bend={7}
-        kind="response"
-        pulseTarget={pulseTarget}
-      />
-    </svg>
+    <>
+      <svg
+        className={`response-thread response-thread--${kind}${animate ? "" : " response-thread--resumed"}${
+          subdued ? " response-thread--subdued" : ""
+        }${concluding ? " response-thread--concluding" : ""}`}
+        viewBox="0 0 100 100"
+        preserveAspectRatio="none"
+        role="img"
+        aria-label={`${lineLabel} from ${playerLabel(sourcePlayer)} to ${playerLabel(targetPlayer)}`}
+      >
+        <TravelingThreadGraphics
+          sourceAnchorId={kind === "block"
+            ? `block-card-anchor-${from}`
+            : `seat-anchor-${from}`}
+          targetAnchorId={`${targetKind}-card-anchor-${to}`}
+          labelElementId={lineLabelId}
+          stopAtTargetEdge
+          bend={7}
+          kind="response"
+          pulseTarget={pulseTarget}
+          animate={animate}
+          paused={paused}
+        />
+      </svg>
+      <span
+        id={lineLabelId}
+        className={`response-thread__label response-thread__label--${kind}${
+          subdued ? " response-thread__label--subdued" : ""}${
+          concluding ? " response-thread__label--concluding" : ""
+        }`}
+        aria-hidden="true"
+      >
+        {lineLabel}
+      </span>
+    </>
   );
 }
 
@@ -971,7 +1480,11 @@ function CourtStatus({ view }: { view: PublicGameView }) {
 function TablePieces({ view }: { view: PublicGameView }) {
   return (
     <div className="table-pieces" aria-label={`${view.court_deck_count} cards and ${view.treasury} coins remain`}>
-      <div className="table-pieces__deck" aria-label={`${view.court_deck_count} cards in the Court deck`}>
+      <div
+        id="court-deck-anchor"
+        className="table-pieces__deck"
+        aria-label={`${view.court_deck_count} cards in the Court deck`}
+      >
         {Array.from({ length: view.court_deck_count }, (_, index) => (
           <img
             key={`deck-${index}`}
@@ -1003,18 +1516,399 @@ function TablePieces({ view }: { view: PublicGameView }) {
   );
 }
 
+function InfluenceReveal({
+  reveal,
+  view,
+}: {
+  reveal: NonNullable<CourtResult["reveal"]>;
+  view: PublicGameView;
+}) {
+  const player = view.players.find((candidate) => candidate.id === reveal.playerId);
+  if (!player) return null;
+  const { x, y } = seatPosition(player, view.players.length);
+  const inward = inwardOffset(x, y);
+  const style = {
+    "--reveal-x": `${x}%`,
+    "--reveal-y": `${y}%`,
+    "--reveal-inward-x": `${inward.x * 1.7}px`,
+    "--reveal-inward-y": `${inward.y * 1.7}px`,
+  } as CSSProperties;
+  return (
+    <div
+      className="influence-reveal"
+      style={style}
+      role="img"
+      aria-label={`${playerLabel(player)} reveals ${ROLE_LABELS[reveal.role]}`}
+    >
+      <div className="influence-reveal__card">
+        <img
+          className="influence-reveal__face influence-reveal__face--back"
+          src="/images/cards/card_back.png"
+          alt=""
+        />
+        <img
+          className="influence-reveal__face influence-reveal__face--front"
+          src={roleImage(reveal.role)}
+          alt=""
+        />
+      </div>
+    </div>
+  );
+}
+
+type CardTransferGeometry = {
+  x: number;
+  y: number;
+  dx: number;
+  dy: number;
+  scale: number;
+  width: number;
+  height: number;
+};
+
+function useCardTransferGeometry(
+  sourceId: string,
+  targetId: string,
+): CardTransferGeometry | null {
+  const [geometry, setGeometry] = useState<CardTransferGeometry | null>(null);
+  useLayoutEffect(() => {
+    const measure = () => {
+      const source = document.getElementById(sourceId);
+      const target = document.getElementById(targetId);
+      if (!source || !target) return;
+      const sourceRect = source.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      const x = sourceRect.left + sourceRect.width / 2;
+      const y = sourceRect.top + sourceRect.height / 2;
+      setGeometry({
+        x,
+        y,
+        dx: targetRect.left + targetRect.width / 2 - x,
+        dy: targetRect.top + targetRect.height / 2 - y,
+        scale: Math.max(0.2, Math.min(2.2, targetRect.height / Math.max(1, sourceRect.height))),
+        width: sourceRect.width || 52,
+        height: sourceRect.height || 78,
+      });
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [sourceId, targetId]);
+  return geometry;
+}
+
+function ReplacementDraw({
+  playerId,
+  playerName,
+  humanCard,
+}: {
+  playerId: string;
+  playerName: string;
+  humanCard: PrivateCard | null;
+}) {
+  const targetId = humanCard ? `hand-card-${humanCard.id}` : `influence-stack-${playerId}`;
+  const geometry = useCardTransferGeometry("court-deck-anchor", targetId);
+
+  if (!geometry) return null;
+  const style = {
+    "--replacement-start-x": `${geometry.x}px`,
+    "--replacement-start-y": `${geometry.y}px`,
+    "--replacement-dx": `${geometry.dx}px`,
+    "--replacement-dy": `${geometry.dy}px`,
+    "--replacement-scale": geometry.scale,
+    "--replacement-width": `${geometry.width}px`,
+    "--replacement-height": `${geometry.height}px`,
+    "--replacement-duration": `${RESULT_DURATION_MS}ms`,
+  } as CSSProperties;
+  return (
+    <div
+      className={`replacement-draw${humanCard ? " replacement-draw--human" : ""}`}
+      style={style}
+      role="img"
+      aria-label={`Replacement card drawn from the Court deck to ${playerName}`}
+    >
+      <div className="replacement-draw__card">
+        <img
+          className="replacement-draw__face replacement-draw__face--back"
+          src="/images/cards/card_back.png"
+          alt=""
+        />
+        {humanCard && (
+          <img
+            className="replacement-draw__face replacement-draw__face--front"
+            src={roleImage(humanCard.role)}
+            alt=""
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ProofReturn({
+  proof,
+  playerName,
+}: {
+  proof: NonNullable<CourtResult["proofReturn"]>;
+  playerName: string;
+}) {
+  const sourceId = `${proof.claimKind}-card-anchor-${proof.playerId}`;
+  const geometry = useCardTransferGeometry(sourceId, "court-deck-anchor");
+  if (!geometry) return null;
+  const style = {
+    "--proof-start-x": `${geometry.x}px`,
+    "--proof-start-y": `${geometry.y}px`,
+    "--proof-dx": `${geometry.dx}px`,
+    "--proof-dy": `${geometry.dy}px`,
+    "--proof-scale": geometry.scale,
+    "--proof-final-scale": geometry.scale * 0.86,
+    "--proof-width": `${geometry.width}px`,
+    "--proof-height": `${geometry.height}px`,
+    "--proof-duration": `${RESULT_DURATION_MS}ms`,
+  } as CSSProperties;
+  return (
+    <div
+      className="proof-return"
+      style={style}
+      role="img"
+      aria-label={`${ROLE_LABELS[proof.role]} returned from ${playerName} to the Court deck`}
+    >
+      <img src={roleImage(proof.role)} alt="" />
+    </div>
+  );
+}
+
+function CourtResultBanner({
+  result,
+  delayed,
+}: {
+  result: CourtResult;
+  delayed: boolean;
+}) {
+  return (
+    <div
+      key={result.sequence}
+      className={`court-result court-result--${result.kind}${delayed ? " court-result--delayed" : ""}`}
+      role="status"
+      aria-label={`Action result: ${result.label}`}
+    >
+      {result.label}
+    </div>
+  );
+}
+
+function usePausableTimeout(
+  callback: () => void,
+  duration: number,
+  paused: boolean,
+  timerKey: string | number | null,
+): void {
+  const callbackRef = useRef(callback);
+  const timerStateRef = useRef({
+    key: null as string | number | null,
+    remaining: 0,
+  });
+
+  useEffect(() => {
+    callbackRef.current = callback;
+  }, [callback]);
+
+  useEffect(() => {
+    const timerState = timerStateRef.current;
+    if (timerState.key !== timerKey) {
+      timerState.key = timerKey;
+      timerState.remaining = duration;
+    }
+    if (timerKey === null || paused) return;
+
+    const startedAt = Date.now();
+    const timeout = window.setTimeout(() => {
+      timerState.remaining = 0;
+      callbackRef.current();
+    }, timerState.remaining);
+    return () => {
+      window.clearTimeout(timeout);
+      if (timerState.key === timerKey && timerState.remaining > 0) {
+        timerState.remaining = Math.max(0, timerState.remaining - (Date.now() - startedAt));
+      }
+    };
+  }, [duration, paused, timerKey]);
+}
+
+function useCourtResultSequence(
+  view: PublicGameView,
+  delayActions: boolean,
+  paused: boolean,
+): CourtResult | null {
+  const results = courtResultsForLatestAction(view);
+  const allResults = courtResultsForHistory(view);
+  const actionDeclarations = view.history.filter((event) => event.type === "action_declared");
+  const recentResultBoundary = actionDeclarations.at(-2)?.sequence ?? 0;
+  const initialResults = allResults
+    .filter((result) => result.sequence > recentResultBoundary)
+    .map((result) => ({
+      ...result,
+      delayed: delayActions && result.kind === "action",
+  }));
+  const [active, setActive] = useState<CourtResult | null>(() => initialResults[0] ?? null);
+  const queued = useRef<CourtResult[]>(initialResults.slice(1));
+  const [seenSequences, setSeenSequences] = useState(
+    () => new Set(allResults.map((result) => result.sequence)),
+  );
+  const latestSequence = view.history.at(-1)?.sequence ?? 0;
+  const previousLatest = useRef(latestSequence);
+  const unseenResults = allResults.filter((result) => !seenSequences.has(result.sequence));
+  const immediateResult = !active && unseenResults.length > 0
+    ? {
+        ...unseenResults[0],
+        delayed: delayActions && unseenResults[0].kind === "action",
+      }
+    : null;
+
+  useEffect(() => {
+    if (latestSequence < previousLatest.current) {
+      const resetResults = results.map((result) => ({
+        ...result,
+        delayed: delayActions && result.kind === "action",
+      }));
+      setSeenSequences(new Set(allResults.map((result) => result.sequence)));
+      queued.current = resetResults.slice(1);
+      setActive(resetResults[0] ?? null);
+      previousLatest.current = latestSequence;
+      return;
+    }
+    previousLatest.current = latestSequence;
+    if (unseenResults.length === 0) return;
+    const promotion = window.setTimeout(() => {
+      setSeenSequences((current) => {
+        const next = new Set(current);
+        for (const result of unseenResults) next.add(result.sequence);
+        return next;
+      });
+      for (const result of unseenResults) {
+        queued.current.push({
+          ...result,
+          delayed: delayActions && result.kind === "action",
+        });
+      }
+      if (!active && queued.current.length > 0) {
+        setActive(queued.current.shift() ?? null);
+      }
+    }, 0);
+    return () => window.clearTimeout(promotion);
+  }, [active, allResults, delayActions, latestSequence, results, unseenResults]);
+
+  usePausableTimeout(
+    () => setActive(queued.current.shift() ?? null),
+    active ? RESULT_DURATION_MS + (active.delayed ? RESULT_ENTRY_DELAY_MS : 0) : 0,
+    paused,
+    active?.sequence ?? null,
+  );
+
+  return active ?? immediateResult;
+}
+
+type PresentationTimeline = {
+  result: CourtResult | null;
+  resultActive: boolean;
+  action: NonNullable<PublicGameView["pending_action"]> | null;
+  block: PublicGameView["pending_block"];
+  challenge: InteractionState["challenge"];
+  actionSequence: number;
+  actionVisible: boolean;
+  actionAnimate: boolean;
+  actionSubdued: boolean;
+  actionConcluding: boolean;
+  actionDelayed: boolean;
+  actionCanceled: boolean;
+  actionSucceeded: boolean;
+  blockAnimate: boolean;
+  blockSubdued: boolean;
+  blockConcluding: boolean;
+  challengeConcluding: boolean;
+  activePlayerId: string;
+  outcomes: Map<string, "positive" | "negative">;
+};
+
+function usePresentationTimeline(view: PublicGameView, paused: boolean): PresentationTimeline {
+  const interaction = interactionState(view);
+  const animateUnseenAction = interaction.status !== "pending" && !interaction.actionProgressed;
+  const result = useCourtResultSequence(view, animateUnseenAction, paused);
+  const presentedInteraction = result
+    ? interactionState(view, result.actionSequence)
+    : interaction;
+  const resultActive = result !== null;
+  const action = result?.action ?? interaction.action;
+  const block = resultActive ? result.block : interaction.block;
+  const challenge = resultActive ? result.challenge : interaction.challenge;
+  const actionCanceled = presentedInteraction.status === "canceled";
+  const actionSucceeded = presentedInteraction.status === "succeeded";
+  const finalPresentedResultSequence = result
+    ? courtResultsForHistory(view)
+        .filter((candidate) => candidate.actionSequence === result.actionSequence)
+        .at(-1)?.sequence ?? null
+    : null;
+  const actionConcluding = result !== null
+    && (
+      (presentedInteraction.concludingSequence !== null
+        && result.sequence >= presentedInteraction.concludingSequence)
+      || (view.winner_id !== null && result.kind === "death")
+      || (presentedInteraction.status === "ended"
+        && result.sequence === finalPresentedResultSequence)
+    );
+  return {
+    result,
+    resultActive,
+    action,
+    block,
+    challenge,
+    actionSequence: result?.actionSequence ?? interaction.actionSequence,
+    actionVisible: action !== null
+      && result?.kind !== "winner"
+      && (resultActive || interaction.status === "pending"),
+    actionAnimate: resultActive ? Boolean(result.delayed) : !interaction.actionProgressed,
+    actionSubdued: Boolean(block || challenge),
+    actionConcluding,
+    actionDelayed: Boolean(result?.delayed),
+    actionCanceled,
+    actionSucceeded: resultActive ? result.kind === "action" : actionSucceeded,
+    blockAnimate: !resultActive && !interaction.blockProgressed,
+    blockSubdued: Boolean(challenge),
+    blockConcluding: Boolean(block) && (Boolean(result?.blockConcluding) || actionConcluding),
+    challengeConcluding: Boolean(challenge) && (Boolean(result?.challenge) || actionConcluding),
+    activePlayerId: result?.actorId ?? view.active_player_id,
+    outcomes: playerOutcomesForEvent(view, result?.sequence ?? null),
+  };
+}
+
+function latestEventSequence(
+  view: PublicGameView,
+  predicate: (event: GameEvent) => boolean,
+): number {
+  return [...view.history].reverse().find(predicate)?.sequence ?? 0;
+}
+
+function usePresentationGate(key: string | null, duration: number, paused: boolean): boolean {
+  const [completedKey, setCompletedKey] = useState<string | null>(null);
+  usePausableTimeout(() => setCompletedKey(key), duration, paused, key);
+
+  return key === null || completedKey === key;
+}
+
 function PrivateHand({
   cards,
   revealedRoles,
   choosingInitialInfluence,
   highlightedRole,
   fallen,
+  replacement,
 }: {
   cards: PrivateCard[];
   revealedRoles: Role[];
   choosingInitialInfluence: boolean;
   highlightedRole: Role | null;
   fallen: boolean;
+  replacement: { sequence: number; returnedRole: Role | null } | null;
 }) {
   const guidance = cards.length > 0
     ? "Only you can see hidden cards"
@@ -1022,7 +1916,24 @@ function PrivateHand({
       ? "Choose your first influence in the right column"
       : "You have been eliminated";
   return (
-    <section className={`private-hand${fallen ? " private-hand--fallen" : ""}`}>
+    <section
+      className={`private-hand${fallen ? " private-hand--fallen" : ""}${
+        replacement ? " private-hand--replacement" : ""
+      }`}
+    >
+      {replacement && (
+        <div key={replacement.sequence} className="replacement-notice" role="status">
+          <b>↻</b>
+          <span>
+            <strong>
+              {replacement.returnedRole
+                ? `${ROLE_LABELS[replacement.returnedRole]} returned`
+                : "Proven card returned"}
+            </strong>
+            <small>Replacement drawn—even if it is the same character.</small>
+          </span>
+        </div>
+      )}
       <div className="section-heading">
         <span>Your influence</span>
         <small>{guidance}</small>
@@ -1031,6 +1942,7 @@ function PrivateHand({
         {cards.map((card) => (
           <figure
             key={card.id}
+            id={`hand-card-${card.id}`}
             className={`role-card${card.role === highlightedRole ? " role-card--highlighted" : ""}`}
             tabIndex={0}
           >
@@ -1193,8 +2105,8 @@ function DecisionPanel({
 }
 
 function HistoryPanel({ view }: { view: PublicGameView }) {
-  const events = view.history.slice(-80);
-  const latestSequence = events.at(-1)?.sequence ?? 0;
+  const events = [...view.history.slice(-80)].reverse();
+  const latestSequence = events.at(0)?.sequence ?? 0;
   const previousLatest = useRef(latestSequence);
   const listRef = useRef<HTMLOListElement>(null);
 
@@ -1202,7 +2114,7 @@ function HistoryPanel({ view }: { view: PublicGameView }) {
     if (latestSequence <= previousLatest.current) return;
     previousLatest.current = latestSequence;
     window.requestAnimationFrame(() => {
-      listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
+      listRef.current?.scrollTo({ top: 0, behavior: "smooth" });
     });
   }, [latestSequence]);
 
@@ -1227,48 +2139,6 @@ function HistoryPanel({ view }: { view: PublicGameView }) {
         })}
       </ol>
     </section>
-  );
-}
-
-function SpectatorControls({
-  playback,
-  busy,
-  status,
-  onPlayback,
-  onStep,
-}: {
-  playback: Playback;
-  busy: boolean;
-  status: MatchPayload["status"];
-  onPlayback: (playback: Playback) => void;
-  onStep: () => void;
-}) {
-  const disabled = status === "finished" || status === "agent_error";
-  return (
-    <div className="spectator-controls">
-      <button
-        className="control-step"
-        disabled={busy || disabled}
-        onClick={() => {
-          onPlayback("paused");
-          onStep();
-        }}
-      >
-        <span>›</span> Step
-      </button>
-      <div className="segmented segmented--compact">
-        {(["paused", "1x", "2x", "instant"] as Playback[]).map((speed) => (
-          <button
-            key={speed}
-            className={playback === speed ? "selected" : ""}
-            disabled={disabled}
-            onClick={() => onPlayback(speed)}
-          >
-            {speed === "paused" ? "Ⅱ" : speed === "instant" ? "∞" : speed}
-          </button>
-        ))}
-      </div>
-    </div>
   );
 }
 
@@ -1409,13 +2279,13 @@ function GameScreen({
   match,
   health,
   busy,
-  playback,
+  spectatorPaused,
   debugOpen,
   debugData,
   debugLoading,
   onChoose,
   onStep,
-  onPlayback,
+  onSpectatorPaused,
   onNewGame,
   onConfigureKey,
   onToggleDebug,
@@ -1423,13 +2293,13 @@ function GameScreen({
   match: MatchPayload;
   health: HealthPayload | null;
   busy: boolean;
-  playback: Playback;
+  spectatorPaused: boolean;
   debugOpen: boolean;
   debugData: Record<string, unknown> | null;
   debugLoading: boolean;
   onChoose: (id: string) => void;
   onStep: () => void;
-  onPlayback: (playback: Playback) => void;
+  onSpectatorPaused: (paused: boolean) => void;
   onNewGame: () => void;
   onConfigureKey: () => void;
   onToggleDebug: () => void;
@@ -1441,31 +2311,85 @@ function GameScreen({
   const humanPlayer = match.human_player_id
     ? view.players.find((player) => player.id === match.human_player_id)
     : null;
-  const canceledDisplay = canceledAction(view);
-  const successfulDisplay = successfulAction(view);
-  const displayedAction = view.pending_action ?? canceledDisplay ?? successfulDisplay ?? recentAction(view);
-  const actionCanceled = canceledDisplay !== null;
-  const actionSucceeded = canceledDisplay === null && successfulDisplay !== null;
-  const actionTransient = view.pending_action === null;
-  const actionTarget = displayedAction?.target_id
-    ? view.players.find((candidate) => candidate.id === displayedAction.target_id) ?? null
+  const presentation = usePresentationTimeline(view, spectatorPaused);
+  const courtResult = presentation.result;
+  const visualAction = presentation.action;
+  const visualActionTarget = visualAction?.target_id
+    ? view.players.find((candidate) => candidate.id === visualAction.target_id) ?? null
     : null;
-  const displayedChallenge = view.pending_challenge ?? recentChallenge(view);
-  const challengeTransient = view.pending_challenge === null && view.phase !== "influence_loss";
-  const blockVisible = view.pending_block !== null && view.pending_action !== null;
-  const actionSequence = latestActionSequence(view);
-  const actionHadResponse = latestActionHadResponse(view);
-  const actionResolved = actionCanceled || actionSucceeded;
-  const actionOutcomes = recentPlayerOutcomes(view);
+  const resultSequenceActive = presentation.resultActive;
+  const visualBlock = presentation.block;
+  const visualChallenge = presentation.challenge;
+  const replacementHistory = recentCardReplacement(view, match.human_player_id);
+  const privateReplacement = seatView?.latest_card_replacement ?? null;
+  const replacementPlayer = courtResult?.replacement
+    ? view.players.find((player) => player.id === courtResult.replacement?.playerId) ?? null
+    : null;
+  const proofPlayer = courtResult?.proofReturn
+    ? view.players.find((player) => player.id === courtResult.proofReturn?.playerId) ?? null
+    : null;
+  const winnerPresented = view.winner_id !== null
+    && (courtResult?.kind === "winner" || courtResult === null);
+  const humanReplacement = courtResult?.replacement?.playerId === match.human_player_id
+    && replacementHistory?.sequence === courtResult.sequence
+    ? replacementHistory
+    : null;
   const thinkingDecisions = new Map(
     (match.thinking_players ?? []).map(({ player_id, decision_kind }) => [
       player_id,
       decision_kind,
     ]),
   );
+  const presentationGate = courtResult
+    ? {
+        key: `result-${courtResult.sequence}`,
+        duration: RESULT_DURATION_MS + (courtResult.delayed ? RESULT_ENTRY_DELAY_MS : 0),
+      }
+    : visualChallenge && !resultSequenceActive
+      ? {
+          key: `challenge-${latestEventSequence(
+            view,
+            (event) => event.type === "challenge_declared"
+              && event.actor_id === visualChallenge.challenger_id,
+          )}`,
+          duration: THREAD_DRAW_DURATION_MS,
+        }
+      : visualBlock && presentation.blockAnimate
+        ? {
+            key: `block-${latestEventSequence(
+              view,
+              (event) => event.type === "block_declared"
+                && event.actor_id === visualBlock.blocker_id,
+            )}`,
+            duration: THREAD_DRAW_DURATION_MS,
+          }
+        : presentation.actionVisible && presentation.actionAnimate
+          ? {
+              key: `action-${presentation.actionSequence}`,
+              duration: THREAD_DRAW_DURATION_MS,
+            }
+          : { key: null, duration: 0 };
+  const presentationReady = usePresentationGate(
+    presentationGate.key,
+    presentationGate.duration,
+    spectatorPaused,
+  );
+
+  useEffect(() => {
+    if (
+      match.mode !== "ai_only"
+      || spectatorPaused
+      || busy
+      || !presentationReady
+      || match.status === "finished"
+      || match.status === "agent_error"
+    ) return;
+    const timer = window.setTimeout(onStep, 0);
+    return () => window.clearTimeout(timer);
+  }, [busy, match.mode, match.status, onStep, presentationReady, spectatorPaused]);
 
   return (
-    <main className="game-shell">
+    <main className={`game-shell${spectatorPaused ? " game-shell--paused" : ""}`}>
       <header className="game-header">
         <div className="game-header__brand">
           <div className="brand-mark brand-mark--small">E</div>
@@ -1477,12 +2401,21 @@ function GameScreen({
         <div className="game-header__status">
           <span className={`status-light status-light--${match.status}`} />
           <div>
-            <small>{titleCase(match.status)}</small>
-            <strong>{statusCopy(match)}</strong>
+            <small>{spectatorPaused ? "Paused" : titleCase(match.mode === "ai_only" && match.status === "paused" ? "running" : match.status)}</small>
+            <strong>{statusCopy(match, spectatorPaused)}</strong>
           </div>
         </div>
         <nav className="game-header__actions">
           {!health?.openai_configured && <button className="text-button text-button--key" onClick={onConfigureKey}>Add API key</button>}
+          {match.mode === "ai_only" && match.status !== "finished" && match.status !== "agent_error" && (
+            <button
+              className="text-button spectator-pause"
+              aria-pressed={spectatorPaused}
+              onClick={() => onSpectatorPaused(!spectatorPaused)}
+            >
+              {spectatorPaused ? "Resume" : "Pause"}
+            </button>
+          )}
           <button className="text-button" onClick={onToggleDebug}>Developer</button>
           <button className="secondary-button" onClick={onNewGame}>New game</button>
         </nav>
@@ -1490,48 +2423,57 @@ function GameScreen({
 
       <div className="game-content">
         <section className="board-wrap">
-          <div className="board" aria-label="Coup game table">
+          <div
+            className={`board${spectatorPaused ? " board--paused" : ""}`}
+            aria-label="Coup game table"
+            style={{
+              "--result-duration": `${RESULT_DURATION_MS}ms`,
+              "--result-entry-delay": `${RESULT_ENTRY_DELAY_MS}ms`,
+              "--thread-draw-duration": `${THREAD_DRAW_DURATION_MS}ms`,
+            } as CSSProperties}
+          >
             <img className="board__art" src="/images/table.png" alt="Ornate Renaissance game table" />
             <div className="board__vignette" />
-            {displayedAction
-              && !actionResolved
-              && view.phase !== "influence_loss"
-              && !displayedChallenge
-              && !blockVisible
-              && !(actionTransient && actionHadResponse)
-              && (
+            {presentation.actionVisible && visualAction && (
               <ActionThread
-                key={`action-${actionSequence}`}
-                action={displayedAction}
+                key={`action-${presentation.actionSequence}`}
+                action={visualAction}
                 view={view}
-                transient={actionTransient}
-                canceled={actionCanceled}
-                succeeded={actionSucceeded}
-                pulseTarget
+                canceled={presentation.actionCanceled}
+                succeeded={presentation.actionSucceeded}
+                pulseTarget={!presentation.resultActive || presentation.actionDelayed}
+                animate={presentation.actionAnimate}
+                subdued={presentation.actionSubdued}
+                concluding={presentation.actionConcluding}
+                concludingDelayed={presentation.actionDelayed}
+                paused={spectatorPaused}
               />
             )}
-            {!actionResolved
-              && view.phase !== "influence_loss"
-              && view.pending_block
-              && view.pending_action
-              && !displayedChallenge && (
+            {visualBlock && visualAction && (
               <ResponseThread
-                from={view.pending_block.blocker_id}
-                to={view.pending_action.actor_id}
+                from={visualBlock.blocker_id}
+                to={visualAction.actor_id}
                 view={view}
                 kind="block"
                 targetKind="action"
-                pulseTarget
+                pulseTarget={!visualChallenge && presentation.blockAnimate}
+                animate={presentation.blockAnimate}
+                subdued={presentation.blockSubdued}
+                concluding={presentation.blockConcluding}
+                paused={spectatorPaused}
               />
             )}
-            {!actionResolved && view.phase !== "influence_loss" && displayedChallenge && (
+            {visualChallenge && (
               <ResponseThread
-                from={displayedChallenge.challenger_id}
-                to={displayedChallenge.claimant_id}
+                from={visualChallenge.challenger_id}
+                to={visualChallenge.claimant_id}
                 view={view}
                 kind="challenge"
-                targetKind={displayedChallenge.claim_kind}
-                transient={challengeTransient}
+                targetKind={visualChallenge.claim_kind}
+                pulseTarget={!resultSequenceActive}
+                animate={!resultSequenceActive}
+                concluding={presentation.challengeConcluding}
+                paused={spectatorPaused}
               />
             )}
             {view.players.map((player) => (
@@ -1539,44 +2481,61 @@ function GameScreen({
                 key={player.id}
                 player={player}
                 count={view.players.length}
-                active={player.id === view.active_player_id}
+                active={player.id === presentation.activePlayerId}
                 human={player.id === match.human_player_id}
+                winning={winnerPresented && player.id === view.winner_id}
+                revealedRoles={revealedRolesAtPresentation(
+                  player,
+                  view,
+                  courtResult?.sequence ?? null,
+                )}
                 thinkingLabel={
-                  thinkingDecisions.has(player.id)
+                  resultSequenceActive
+                    ? null
+                    : thinkingDecisions.has(player.id)
                     ? thinkingCopy(thinkingDecisions.get(player.id) ?? null)
                     : player.id === match.thinking_player_id
                       ? thinkingCopy(match.thinking_decision_kind)
                       : null
                 }
                 pendingAction={
-                  !actionResolved && displayedAction?.actor_id === player.id
-                    ? displayedAction
+                  visualAction?.actor_id === player.id
+                    && presentation.actionVisible
+                    && (!presentation.resultActive
+                      || Boolean(visualAction.claimed_role)
+                      || Boolean(visualBlock))
+                    ? visualAction
                     : null
                 }
-                actionTarget={actionTarget}
-                actionTransient={actionTransient}
-                responseKind={
-                  actionResolved
-                    ? null
-                    : displayedChallenge?.challenger_id === player.id
-                    ? "challenging"
-                    : view.pending_block?.blocker_id === player.id
-                      ? "blocking"
-                      : null
-                }
-                responseRole={
-                  !actionResolved && view.pending_block?.blocker_id === player.id
-                    ? view.pending_block.claimed_role
+                actionTarget={visualActionTarget}
+                actionEntering={presentation.actionAnimate}
+                actionSubdued={presentation.actionSubdued}
+                actionConcluding={presentation.actionConcluding}
+                actionConcludingDelayed={presentation.actionDelayed}
+                blockingRole={
+                  visualBlock?.blocker_id === player.id
+                    ? visualBlock.claimed_role
                     : null
                 }
-                responseTransient={
-                  displayedChallenge?.challenger_id === player.id && challengeTransient
-                }
-                outcome={actionOutcomes.get(player.id) ?? null}
+                blockEntering={presentation.blockAnimate}
+                blockSubdued={presentation.blockSubdued}
+                blockConcluding={presentation.blockConcluding}
+                challenging={visualChallenge?.challenger_id === player.id}
+                outcome={presentation.outcomes.get(player.id) ?? null}
+                outcomeDelayed={presentation.actionDelayed}
               />
             ))}
             <TablePieces view={view} />
-            {busy && thinkingDecisions.size === 0 && !match.thinking_player_id && (
+            {courtResult?.reveal && (
+              <InfluenceReveal reveal={courtResult.reveal} view={view} />
+            )}
+            {courtResult && (
+              <CourtResultBanner result={courtResult} delayed={Boolean(courtResult.delayed)} />
+            )}
+            {!resultSequenceActive
+              && busy
+              && thinkingDecisions.size === 0
+              && !match.thinking_player_id && (
               <div className="deliberating">
                 <span className="quill">✦</span>
                 <div>
@@ -1589,10 +2548,15 @@ function GameScreen({
           {seatView && humanPlayer && (
             <PrivateHand
               cards={seatView.hidden_cards}
-              revealedRoles={humanPlayer.revealed_roles}
+              revealedRoles={revealedRolesAtPresentation(
+                humanPlayer,
+                view,
+                courtResult?.sequence ?? null,
+              )}
               choosingInitialInfluence={seatView.setup_choices.length > 0}
               highlightedRole={highlightedRole}
               fallen={!humanPlayer.is_alive && view.phase !== "setup_selection"}
+              replacement={humanReplacement}
             />
           )}
         </section>
@@ -1611,26 +2575,17 @@ function GameScreen({
               ))
             )}
           </section>
-          {match.mode === "ai_only" && (
-            <SpectatorControls
-              playback={playback}
-              busy={busy}
-              status={match.status}
-              onPlayback={onPlayback}
-              onStep={onStep}
-            />
-          )}
           {match.pending_human_decision && (
             <DecisionPanel
               decision={match.pending_human_decision}
               view={view}
               cards={seatView?.hidden_cards ?? []}
-              busy={busy}
+              busy={busy || !presentationReady}
               onChoose={onChoose}
               onHighlightRole={setHighlightedRole}
             />
           )}
-          {match.status === "finished" && (
+          {match.status === "finished" && winnerPresented && (
             <section className="victory-panel">
               <span className="victory-panel__crown">♛</span>
               <p className="eyebrow">The intrigue is settled</p>
@@ -1641,13 +2596,31 @@ function GameScreen({
           {!match.pending_human_decision && match.status !== "finished" && !match.last_error && (
             <section className="waiting-panel">
               <span className="waiting-panel__seal">E</span>
-              <p>{match.mode === "ai_only" ? "Use the controls above to advance the court." : "The other players are plotting their next moves."}</p>
+              <p>The other players are plotting their next moves.</p>
               {!health?.openai_configured && <small>An OpenAI API key is required for agent decisions.</small>}
             </section>
           )}
           <HistoryPanel view={view} />
         </aside>
       </div>
+      {courtResult?.proofReturn && proofPlayer && (
+        <ProofReturn
+          proof={courtResult.proofReturn}
+          playerName={playerLabel(proofPlayer)}
+        />
+      )}
+      {courtResult?.replacement && replacementPlayer && (
+        <ReplacementDraw
+          playerId={courtResult.replacement.playerId}
+          playerName={playerLabel(replacementPlayer)}
+          humanCard={
+            courtResult.replacement.playerId === match.human_player_id
+              && privateReplacement?.sequence === courtResult.sequence
+              ? privateReplacement.card
+              : null
+          }
+        />
+      )}
       {debugOpen && <DebugDrawer data={debugData} loading={debugLoading} onClose={onToggleDebug} />}
     </main>
   );
@@ -1660,7 +2633,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showSetup, setShowSetup] = useState(false);
-  const [playback, setPlayback] = useState<Playback>("paused");
+  const [spectatorPaused, setSpectatorPaused] = useState(false);
   const [debugOpen, setDebugOpen] = useState(false);
   const [debugData, setDebugData] = useState<Record<string, unknown> | null>(null);
   const [debugLoading, setDebugLoading] = useState(false);
@@ -1700,7 +2673,6 @@ export default function App() {
         .catch((caught) => {
           if (!active || !isMissingMatch(caught)) return;
           setMatch(null);
-          setPlayback("paused");
           setError(
             "The local server restarted and its in-memory game was cleared. Start a new court to continue.",
           );
@@ -1739,7 +2711,6 @@ export default function App() {
     } catch (caught) {
       if (isMissingMatch(caught)) {
         setMatch(null);
-        setPlayback("paused");
         setShowSetup(false);
         setError(
           "The local server restarted and its in-memory game was cleared. Start a new court to continue.",
@@ -1755,7 +2726,7 @@ export default function App() {
   }, []);
 
   const startGame = useCallback(async (players: number, mode: MatchMode) => {
-    setPlayback("paused");
+    setSpectatorPaused(false);
     const payload = await mutate(() => api.create(players, mode));
     if (payload) setShowSetup(false);
   }, [mutate]);
@@ -1773,20 +2744,6 @@ export default function App() {
   const retry = useCallback(() => {
     void mutate(api.retry);
   }, [mutate]);
-
-  useEffect(() => {
-    if (
-      !match ||
-      match.mode !== "ai_only" ||
-      playback === "paused" ||
-      busy ||
-      match.status === "finished" ||
-      match.status === "agent_error"
-    ) return;
-    const delay = playback === "1x" ? 1000 : playback === "2x" ? 300 : 0;
-    const timer = window.setTimeout(step, delay);
-    return () => window.clearTimeout(timer);
-  }, [busy, match, playback, step]);
 
   const toggleDebug = useCallback(() => {
     setDebugOpen((current) => {
@@ -1824,19 +2781,19 @@ export default function App() {
         match={match}
         health={health}
         busy={busy}
-        playback={playback}
+        spectatorPaused={spectatorPaused}
         debugOpen={debugOpen}
         debugData={debugData}
         debugLoading={debugLoading}
         onChoose={choose}
         onStep={step}
-        onPlayback={setPlayback}
+        onSpectatorPaused={setSpectatorPaused}
         onNewGame={() => setShowSetup(true)}
         onConfigureKey={() => setShowKeyPrompt(true)}
         onToggleDebug={toggleDebug}
       />
     );
-  }, [busy, choose, debugData, debugLoading, debugOpen, health, loading, match, playback, startGame, step, toggleDebug]);
+  }, [busy, choose, debugData, debugLoading, debugOpen, health, loading, match, spectatorPaused, startGame, step, toggleDebug]);
 
   const fatalError = error ?? match?.last_error ?? null;
 

@@ -21,6 +21,7 @@ from evocoup.domain.events import GameEvent
 from evocoup.domain.invariants import assert_valid_state
 from evocoup.domain.models import (
     Card,
+    CardReplacement,
     GameState,
     Influence,
     PendingAction,
@@ -249,14 +250,19 @@ class GameEngine:
             available.extend(state.exchange_drawn)
             keep_count = len(player.hidden_influences)
             exchange_options: list[LegalOption] = []
+            seen_role_sets: set[tuple[str, ...]] = set()
             for kept in combinations(available, keep_count):
+                roles = tuple(sorted(card.role.value for card in kept))
+                if roles in seen_role_sets:
+                    continue
+                seen_role_sets.add(roles)
                 kept_ids = tuple(sorted(card.id for card in kept))
-                roles = ", ".join(card.role.value.title() for card in kept)
+                role_label = ", ".join(role.title() for role in roles)
                 exchange_options.append(
                     LegalOption(
                         id=f"exchange:{','.join(kept_ids)}",
-                        label=f"Keep {roles}",
-                        data={"card_ids": kept_ids, "roles": [card.role.value for card in kept]},
+                        label=f"Keep {role_label}",
+                        data={"card_ids": kept_ids, "roles": list(roles)},
                     )
                 )
             return self._request(
@@ -662,6 +668,11 @@ class GameEngine:
                 EventType.CARD_REPLACED,
                 f"{claimant.name} returned the proven card and drew a replacement.",
                 actor_id=claimant.id,
+            )
+            self.state.latest_card_replacement = CardReplacement(
+                player_id=claimant.id,
+                card=replacement,
+                sequence=self.state.next_event_sequence - 1,
             )
             continuation = (
                 Continuation.CONTINUE_ACTION

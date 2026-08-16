@@ -58,6 +58,13 @@ def test_truthful_action_claim_replaces_card_and_penalizes_challenger() -> None:
         "claim:concede",
     }
     choose(engine, "claim:prove")
+    private_replacement = engine.seat_view(actor.id).latest_card_replacement
+
+    assert private_replacement is not None
+    assert private_replacement.card.id != duke_id
+    assert private_replacement.card in engine.seat_view(actor.id).hidden_cards
+    assert engine.seat_view(challenger.id).latest_card_replacement is None
+
     choose(engine, require_request(engine).options[0].id)
 
     assert len(challenger.hidden_influences) == 1
@@ -115,7 +122,7 @@ def test_exchange_keeps_correct_count_with_one_remaining_influence() -> None:
     request = require_request(engine)
 
     assert request.kind is DecisionKind.EXCHANGE
-    assert len(request.options) == 3
+    assert len(request.options) == len({tuple(option.data["roles"]) for option in request.options})
     assert all(len(option.data["card_ids"]) == 1 for option in request.options)
     choose(engine, request.options[0].id)
 
@@ -123,6 +130,31 @@ def test_exchange_keeps_correct_count_with_one_remaining_influence() -> None:
     assert len(actor.revealed_influences) == 1
     assert len(engine.state.court_deck) == court_count
     assert_valid_state(engine.state)
+
+
+def test_exchange_options_deduplicate_equivalent_role_sets() -> None:
+    engine = GameEngine.new(["Ada", "Babbage", "Curie"], seed=121)
+    actor = engine.state.player(engine.state.active_player_id)
+    set_hidden_roles(engine, actor.id, (Role.CAPTAIN, Role.DUKE))
+    drawn_captain = next(card for card in engine.state.court_deck if card.role is Role.CAPTAIN)
+    drawn_duke = next(card for card in engine.state.court_deck if card.role is Role.DUKE)
+    engine.state.court_deck = [
+        card
+        for card in engine.state.court_deck
+        if card.id not in {drawn_captain.id, drawn_duke.id}
+    ] + [drawn_captain, drawn_duke]
+
+    choose(engine, "action:exchange")
+    pass_all(engine, DecisionKind.ACTION_CHALLENGE)
+    request = require_request(engine)
+
+    assert request.kind is DecisionKind.EXCHANGE
+    assert {option.label for option in request.options} == {
+        "Keep Captain, Captain",
+        "Keep Captain, Duke",
+        "Keep Duke, Duke",
+    }
+    assert len(request.options) == 3
 
 
 def test_steal_transfers_only_the_coins_the_target_has() -> None:

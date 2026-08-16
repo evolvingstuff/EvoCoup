@@ -78,6 +78,13 @@ class PendingInfluenceLoss:
     continuation: Continuation
 
 
+@dataclass(frozen=True, slots=True)
+class CardReplacement:
+    player_id: str
+    card: Card
+    sequence: int
+
+
 @dataclass(slots=True)
 class GameState:
     game_id: str
@@ -99,6 +106,7 @@ class GameState:
     setup_queue: list[str] = field(default_factory=list)
     out_of_play: dict[str, list[Card]] = field(default_factory=dict)
     exchange_drawn: list[Card] = field(default_factory=list)
+    latest_card_replacement: CardReplacement | None = None
     winner_id: str | None = None
     history: list[GameEvent] = field(default_factory=list)
     next_event_sequence: int = 1

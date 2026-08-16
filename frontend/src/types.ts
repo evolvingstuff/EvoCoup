@@ -81,6 +81,7 @@ export interface SeatGameView {
   known_setup_discards: PrivateCard[];
   setup_choices: PrivateCard[];
   exchange_cards: PrivateCard[];
+  latest_card_replacement?: { sequence: number; card: PrivateCard } | null;
   pending_decision: DecisionRequest | null;
 }
 

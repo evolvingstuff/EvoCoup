@@ -16,6 +16,12 @@ class PrivateCardView:
 
 
 @dataclass(frozen=True, slots=True)
+class PrivateCardReplacementView:
+    sequence: int
+    card: PrivateCardView
+
+
+@dataclass(frozen=True, slots=True)
 class PublicPlayerView:
     id: str
     name: str
@@ -74,6 +80,7 @@ class SeatGameView:
     known_setup_discards: tuple[PrivateCardView, ...]
     setup_choices: tuple[PrivateCardView, ...]
     exchange_cards: tuple[PrivateCardView, ...]
+    latest_card_replacement: PrivateCardReplacementView | None
     pending_decision: DecisionRequest | None
 
 
@@ -156,6 +163,15 @@ def seat_view(
             exchange_cards = []
     else:
         exchange_cards = []
+    replacement = state.latest_card_replacement
+    private_replacement = (
+        PrivateCardReplacementView(
+            sequence=replacement.sequence,
+            card=PrivateCardView(replacement.card.id, replacement.card.role),
+        )
+        if replacement is not None and replacement.player_id == player_id
+        else None
+    )
     return SeatGameView(
         public=public_view(state),
         player_id=player_id,
@@ -170,6 +186,7 @@ def seat_view(
             PrivateCardView(card.id, card.role) for card in state.setup_options.get(player_id, [])
         ),
         exchange_cards=tuple(PrivateCardView(card.id, card.role) for card in exchange_cards),
+        latest_card_replacement=private_replacement,
         pending_decision=own_decision,
     )
 
